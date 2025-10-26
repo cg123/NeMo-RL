@@ -25,7 +25,7 @@ import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoTokenizer
 
-from rlkit.algorithms.loss_functions import NLLLoss, CombinedKDLoss
+from rlkit.algorithms.loss_functions import NLLLoss, CombinedKDLoss, KnowledgeDistillationLoss
 from rlkit.algorithms.utils import set_seed, _pad_tensor
 from rlkit.config import (
     KDConfig,
@@ -196,10 +196,12 @@ class KDTrainer:
         alpha = kd_config.get("alpha", KD_DEFAULT_ALPHA)
         temperature = kd_config.get("temperature", KD_DEFAULT_TEMPERATURE)
         
+        kd_loss = KnowledgeDistillationLoss(temperature=temperature)
+        
         self.loss_fn = CombinedKDLoss(
             base_loss=base_loss,
+            kd_loss=kd_loss,
             alpha=alpha,
-            temperature=temperature,
         )
         
         logging.info(f"  ✓ KD loss: alpha={alpha}, temperature={temperature}")

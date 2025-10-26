@@ -679,19 +679,19 @@ class CombinedKDLoss(LossFunction):
     def __init__(
         self, 
         base_loss: LossFunction,
+        kd_loss: KnowledgeDistillationLoss,
         alpha: float,
-        temperature: float = 1.0,
     ):
         """Initialize combined loss.
         
         Args:
             base_loss: Base supervised loss (e.g., NLLLoss)
+            kd_loss: Knowledge distillation loss function
             alpha: Weight for KD loss (α). Range [0, 1].
                       0 = pure supervised, 1 = pure distillation
-            temperature: Temperature for KD loss
         """
         self.base_loss = base_loss
-        self.kd_loss = KnowledgeDistillationLoss(temperature)
+        self.kd_loss = kd_loss
         self.alpha = alpha
         self.loss_type = base_loss.loss_type  # Inherit from base loss
     
