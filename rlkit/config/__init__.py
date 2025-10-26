@@ -16,6 +16,7 @@ from .rl.policy import RewardModelConfig
 from .rl.policy.dtv2 import DTensorV2Config
 from .sft import SFTConfig, SFTMasterConfig
 from .rm import RMConfig, RMMasterConfig
+from .kd import KDConfig, KDLoggerConfig, KDMasterConfig, TeacherConfig, TeacherClusterConfig
 
 __all__ = [
     "RLConfig",
@@ -41,4 +42,9 @@ __all__ = [
     "SFTMasterConfig",
     "RMConfig",
     "RMMasterConfig",
+    "KDConfig",
+    "KDLoggerConfig",
+    "KDMasterConfig",
+    "TeacherConfig",
+    "TeacherClusterConfig",
 ]

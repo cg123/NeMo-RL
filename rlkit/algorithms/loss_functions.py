@@ -571,3 +571,189 @@ class SequencePackingLossWrapper:
                 metrics_accum[k] += v
 
         return loss_accum, metrics_accum
+
+
+class KnowledgeDistillationLoss(LossFunction):
+    """KL divergence loss for knowledge distillation.
+    
+    Computes KL(teacher || student) on softened logits.
+    Uses temperature scaling as in Hinton et al. (2015).
+    
+    Formula:
+        KL = sum_i [ P_teacher(i) * log(P_teacher(i) / P_student(i)) ] * T^2
+    
+    where P are softmax probabilities with temperature T.
+    """
+    
+    def __init__(self, temperature: float = 1.0):
+        self.temperature = temperature
+        self.loss_type = LossType.TOKEN_LEVEL
+    
+    def __call__(
+        self,
+        next_token_logits: Tensor,
+        data: BatchedDataDict,
+        global_valid_seqs: torch.Tensor,
+        global_valid_toks: torch.Tensor,
+        vocab_parallel_rank: Optional[int] = None,
+        vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+        context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        """Compute KL divergence between student and teacher logits.
+        
+        Args:
+            next_token_logits: Student model logits [batch, seq_len, vocab]
+            data: BatchedDataDict containing:
+                - teacher_logits: Teacher model logits [batch, seq_len, vocab]
+                - token_mask: Mask for valid tokens [batch, seq_len]
+                - sample_mask: Mask for valid samples [batch]
+            global_valid_seqs: Number of valid sequences for normalization
+            global_valid_toks: Number of valid tokens for normalization
+            vocab_parallel_rank: Rank in vocab parallel group (if using TP)
+            vocab_parallel_group: Process group for vocab parallelism
+            context_parallel_group: Process group for context parallelism
+        
+        Returns:
+            tuple of (loss, metrics_dict)
+        """
+        # Cast to float32 for numerical stability
+        next_token_logits = next_token_logits.float()
+        
+        # Get teacher logits from data dict
+        teacher_logits = data["teacher_logits"]
+        if teacher_logits.dtype != torch.float32:
+            teacher_logits = teacher_logits.float()
+        
+        token_mask = data["token_mask"][:, 1:]  # Skip first token (no prediction)
+        sample_mask = data["sample_mask"]
+        
+        # Apply temperature scaling
+        T = self.temperature
+        student_log_probs = torch.nn.functional.log_softmax(next_token_logits / T, dim=-1)
+        teacher_probs = torch.nn.functional.softmax(teacher_logits / T, dim=-1)
+        
+        # Compute KL divergence: KL(P||Q) = sum(P * log(P/Q))
+        # Using log_softmax for numerical stability
+        kl_div = torch.nn.functional.kl_div(
+            student_log_probs, 
+            teacher_probs, 
+            reduction='none',
+            log_target=False
+        )
+        
+        # Sum over vocabulary dimension
+        kl_div = kl_div.sum(dim=-1)  # [batch, seq_len]
+        
+        # Scale by T^2 (standard in KD literature)
+        kl_div = kl_div * (T ** 2)
+        
+        # Apply token-level masking
+        masked_kl = masked_mean(
+            kl_div,
+            token_mask,
+            sample_mask,
+            global_normalization_factor=global_valid_toks,
+        )
+        
+        return masked_kl, {
+            "kd_loss": masked_kl.item(),
+            "temperature": T,
+        }
+
+
+class CombinedKDLoss(LossFunction):
+    """Combines base supervised loss with KD loss.
+    
+    total_loss = (1 - α) * base_loss + α * kd_loss
+    
+    where α is the kd_weight parameter.
+    
+    This allows training with both ground truth labels (base_loss) and
+    teacher model outputs (kd_loss) simultaneously.
+    """
+    
+    def __init__(
+        self, 
+        base_loss: LossFunction,
+        kd_weight: float,
+        temperature: float = 1.0,
+    ):
+        """Initialize combined loss.
+        
+        Args:
+            base_loss: Base supervised loss (e.g., NLLLoss)
+            kd_weight: Weight for KD loss (α). Range [0, 1].
+                      0 = pure supervised, 1 = pure distillation
+            temperature: Temperature for KD loss
+        """
+        self.base_loss = base_loss
+        self.kd_loss = KnowledgeDistillationLoss(temperature)
+        self.kd_weight = kd_weight
+        self.loss_type = base_loss.loss_type  # Inherit from base loss
+    
+    def __call__(
+        self,
+        next_token_logits: Tensor,
+        data: BatchedDataDict,
+        global_valid_seqs: torch.Tensor,
+        global_valid_toks: torch.Tensor,
+        vocab_parallel_rank: Optional[int] = None,
+        vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+        context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        """Compute combined loss.
+        
+        Args:
+            next_token_logits: Student model logits
+            data: BatchedDataDict with labels and teacher_logits
+            global_valid_seqs: Number of valid sequences
+            global_valid_toks: Number of valid tokens
+            vocab_parallel_rank: Vocab parallel rank
+            vocab_parallel_group: Vocab parallel process group
+            context_parallel_group: Context parallel process group
+        
+        Returns:
+            tuple of (combined_loss, metrics_dict)
+        """
+        # Compute base supervised loss (e.g., cross-entropy with labels)
+        base_loss_val, base_metrics = self.base_loss(
+            next_token_logits,
+            data,
+            global_valid_seqs,
+            global_valid_toks,
+            vocab_parallel_rank,
+            vocab_parallel_group,
+            context_parallel_group,
+        )
+        
+        # Compute KD loss if teacher logits available
+        if "teacher_logits" in data and data["teacher_logits"] is not None:
+            kd_loss_val, kd_metrics = self.kd_loss(
+                next_token_logits,
+                data,
+                global_valid_seqs,
+                global_valid_toks,
+                vocab_parallel_rank,
+                vocab_parallel_group,
+                context_parallel_group,
+            )
+            
+            # Combine losses: (1-α)*base + α*kd
+            total_loss = (1 - self.kd_weight) * base_loss_val + self.kd_weight * kd_loss_val
+            
+            metrics = {
+                **base_metrics,
+                **kd_metrics,
+                "base_loss": base_loss_val.item(),
+                "kd_weight": self.kd_weight,
+                "total_loss": total_loss.item(),
+            }
+        else:
+            # Fallback to base loss only (useful for validation without teacher)
+            total_loss = base_loss_val
+            metrics = {
+                **base_metrics,
+                "total_loss": total_loss.item(),
+            }
+        
+        return total_loss, metrics
