@@ -869,9 +869,9 @@ def test_knowledge_distillation_loss_basic():
     batch_size = 2
     seq_len = 4
     vocab_size = 8
-    
+
     loss_fn = KnowledgeDistillationLoss(temperature=2.0)
-    
+
     # Create test data
     data = {
         "input_ids": torch.randint(0, vocab_size, (batch_size, seq_len), device=device),
@@ -879,23 +879,28 @@ def test_knowledge_distillation_loss_basic():
         "sample_mask": torch.tensor([1, 1], device=device),
         "num_valid_tokens_in_batch": torch.tensor([5]),  # Total unmasked tokens
     }
-    
+
     # Student logits (random)
     student_logits = torch.randn(batch_size, seq_len, vocab_size, device=device)
-    
+
     # Teacher log probabilities (convert from similar logits)
-    teacher_logits_raw = student_logits + torch.randn(batch_size, seq_len, vocab_size, device=device) * 0.1
+    teacher_logits_raw = (
+        student_logits
+        + torch.randn(batch_size, seq_len, vocab_size, device=device) * 0.1
+    )
     teacher_logprobs = torch.nn.functional.log_softmax(teacher_logits_raw, dim=-1)
     data["teacher_logprobs"] = teacher_logprobs
-    
+
     # Compute loss
     loss, metrics = loss_fn(
         student_logits,
         data,
         global_valid_seqs=torch.sum(data["sample_mask"]),
-        global_valid_toks=torch.sum(data["token_mask"] * data["sample_mask"].unsqueeze(-1)),
+        global_valid_toks=torch.sum(
+            data["token_mask"] * data["sample_mask"].unsqueeze(-1)
+        ),
     )
-    
+
     # Verify loss is scalar and non-negative
     assert loss.shape == torch.Size([]), "Loss should be scalar"
     assert loss >= 0, "KD loss should be non-negative (KL divergence)"
@@ -910,7 +915,7 @@ def test_knowledge_distillation_loss_temperature_scaling():
 
     device = "cuda"
     vocab_size = 8
-    
+
     # Simple case: 1 sample, 1 token
     data = {
         "input_ids": torch.tensor([[0]], device=device),
@@ -918,24 +923,26 @@ def test_knowledge_distillation_loss_temperature_scaling():
         "sample_mask": torch.tensor([1], device=device),
         "num_valid_tokens_in_batch": torch.tensor([1]),
     }
-    
+
     # Create distinct logits
-    student_logits = torch.tensor([[[10.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]]], device=device)
-    teacher_logits_raw = torch.tensor([[[1.0, 10.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]]], device=device)
+    student_logits = torch.tensor(
+        [[[10.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]]], device=device
+    )
+    teacher_logits_raw = torch.tensor(
+        [[[1.0, 10.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]]], device=device
+    )
     teacher_logprobs = torch.nn.functional.log_softmax(teacher_logits_raw, dim=-1)
     data["teacher_logprobs"] = teacher_logprobs
-    
+
     # Test with different temperatures
     loss_t1 = KnowledgeDistillationLoss(temperature=1.0)(
-        student_logits, data,
-        global_valid_seqs=1, global_valid_toks=1
+        student_logits, data, global_valid_seqs=1, global_valid_toks=1
     )[0]
-    
+
     loss_t2 = KnowledgeDistillationLoss(temperature=2.0)(
-        student_logits, data,
-        global_valid_seqs=1, global_valid_toks=1
+        student_logits, data, global_valid_seqs=1, global_valid_toks=1
     )[0]
-    
+
     # Higher temperature should produce smaller loss (softer distributions are more similar)
     # Note: Due to T^2 scaling, this relationship might not always hold
     # But both should be positive and finite
@@ -952,9 +959,9 @@ def test_knowledge_distillation_loss_masking():
 
     device = "cuda"
     vocab_size = 8
-    
+
     loss_fn = KnowledgeDistillationLoss(temperature=2.0)
-    
+
     # Create data with first token masked
     data = {
         "input_ids": torch.tensor([[0, 1, 2]], device=device),
@@ -962,29 +969,31 @@ def test_knowledge_distillation_loss_masking():
         "sample_mask": torch.tensor([1], device=device),
         "num_valid_tokens_in_batch": torch.tensor([2]),
     }
-    
+
     # Create logits where first token has huge difference (should be ignored)
     student_logits = torch.randn(1, 3, vocab_size, device=device)
     teacher_logits_raw = student_logits.clone()
-    teacher_logits_raw[0, 0, :] = teacher_logits_raw[0, 0, :] + 1000.0  # Huge difference in masked token
+    teacher_logits_raw[0, 0, :] = (
+        teacher_logits_raw[0, 0, :] + 1000.0
+    )  # Huge difference in masked token
     teacher_logprobs = torch.nn.functional.log_softmax(teacher_logits_raw, dim=-1)
     data["teacher_logprobs"] = teacher_logprobs
-    
+
     loss_masked, _ = loss_fn(
-        student_logits, data,
-        global_valid_seqs=1, global_valid_toks=2
+        student_logits, data, global_valid_seqs=1, global_valid_toks=2
     )
-    
+
     # Now unmask all tokens
     data["token_mask"] = torch.tensor([[1, 1, 1]], device=device)
     data["num_valid_tokens_in_batch"] = torch.tensor([3])
     loss_unmasked, _ = loss_fn(
-        student_logits, data,
-        global_valid_seqs=1, global_valid_toks=3
+        student_logits, data, global_valid_seqs=1, global_valid_toks=3
     )
-    
+
     # Loss should be much larger when the divergent token is included
-    assert loss_unmasked > loss_masked * 2, "Unmasked loss should be significantly larger"
+    assert loss_unmasked > loss_masked * 2, (
+        "Unmasked loss should be significantly larger"
+    )
 
 
 def test_knowledge_distillation_loss_missing_teacher_logits():
@@ -994,9 +1003,9 @@ def test_knowledge_distillation_loss_missing_teacher_logits():
 
     device = "cuda"
     vocab_size = 8
-    
+
     loss_fn = KnowledgeDistillationLoss(temperature=2.0)
-    
+
     data = {
         "input_ids": torch.tensor([[0, 1]], device=device),
         "token_mask": torch.tensor([[1, 1]], device=device),
@@ -1004,9 +1013,9 @@ def test_knowledge_distillation_loss_missing_teacher_logits():
         "num_valid_tokens_in_batch": torch.tensor([2]),
         # Note: teacher_logprobs is missing
     }
-    
+
     student_logits = torch.randn(1, 2, vocab_size, device=device)
-    
+
     with pytest.raises(KeyError):
         loss_fn(student_logits, data, global_valid_seqs=1, global_valid_toks=2)
 
@@ -1018,14 +1027,14 @@ def test_combined_kd_loss_alpha_blending():
 
     device = "cuda"
     vocab_size = 8
-    
+
     base_loss = NLLLoss()
     kd_loss = KnowledgeDistillationLoss(temperature=2.0)
-    
+
     # Test different alpha values
     for alpha in [0.0, 0.5, 1.0]:
         combined_loss = CombinedKDLoss(base_loss, kd_loss, alpha=alpha)
-        
+
         # Create test data
         data = {
             "input_ids": torch.tensor([[0, 1, 2, 3]], device=device),
@@ -1033,25 +1042,24 @@ def test_combined_kd_loss_alpha_blending():
             "sample_mask": torch.tensor([1], device=device),
             "num_valid_tokens_in_batch": torch.tensor([3]),
         }
-        
+
         student_logits = torch.randn(1, 4, vocab_size, device=device)
         teacher_logits_raw = torch.randn(1, 4, vocab_size, device=device)
         teacher_logprobs = torch.nn.functional.log_softmax(teacher_logits_raw, dim=-1)
         data["teacher_logprobs"] = teacher_logprobs
-        
+
         # Compute combined loss
         total_loss, metrics = combined_loss(
-            student_logits, data,
-            global_valid_seqs=1, global_valid_toks=3
+            student_logits, data, global_valid_seqs=1, global_valid_toks=3
         )
-        
+
         # Verify metrics are present
         assert "total_loss" in metrics
         assert "base_loss" in metrics
         assert "kd_loss" in metrics
         assert "alpha" in metrics
         assert metrics["alpha"] == alpha
-        
+
         # Verify alpha is correctly applied
         if alpha == 0.0:
             # Pure supervised learning
@@ -1068,11 +1076,11 @@ def test_combined_kd_loss_missing_teacher_logits():
 
     device = "cuda"
     vocab_size = 8
-    
+
     base_loss = NLLLoss()
     kd_loss = KnowledgeDistillationLoss(temperature=2.0)
     combined_loss = CombinedKDLoss(base_loss, kd_loss, alpha=0.5)
-    
+
     data = {
         "input_ids": torch.tensor([[0, 1]], device=device),
         "token_mask": torch.tensor([[1, 1]], device=device),
@@ -1080,15 +1088,17 @@ def test_combined_kd_loss_missing_teacher_logits():
         "num_valid_tokens_in_batch": torch.tensor([2]),
         # Note: teacher_logprobs is intentionally missing
     }
-    
+
     student_logits = torch.randn(1, 2, vocab_size, device=device)
-    
+
     # Should raise ValueError with helpful message
     with pytest.raises(ValueError) as exc_info:
         combined_loss(student_logits, data, global_valid_seqs=1, global_valid_toks=2)
-    
+
     assert "teacher_logprobs must be provided" in str(exc_info.value)
-    assert "KDTrainer" in str(exc_info.value)  # Error message should mention where to fix
+    assert "KDTrainer" in str(
+        exc_info.value
+    )  # Error message should mention where to fix
 
 
 def test_combined_kd_loss_numerical_stability():
@@ -1098,30 +1108,31 @@ def test_combined_kd_loss_numerical_stability():
 
     device = "cuda"
     vocab_size = 8
-    
+
     base_loss = NLLLoss()
     kd_loss = KnowledgeDistillationLoss(temperature=2.0)
     combined_loss = CombinedKDLoss(base_loss, kd_loss, alpha=0.5)
-    
+
     data = {
         "input_ids": torch.tensor([[0, 1, 2]], device=device),
         "token_mask": torch.tensor([[0, 1, 1]], device=device),
         "sample_mask": torch.tensor([1], device=device),
         "num_valid_tokens_in_batch": torch.tensor([2]),
     }
-    
+
     # Test with very large logits (should not cause overflow)
     student_logits = torch.randn(1, 3, vocab_size, device=device) * 100
     teacher_logits_raw = torch.randn(1, 3, vocab_size, device=device) * 100
     teacher_logprobs = torch.nn.functional.log_softmax(teacher_logits_raw, dim=-1)
     data["teacher_logprobs"] = teacher_logprobs
-    
+
     loss, metrics = combined_loss(
-        student_logits, data,
-        global_valid_seqs=1, global_valid_toks=2
+        student_logits, data, global_valid_seqs=1, global_valid_toks=2
     )
-    
+
     # Verify no NaN or Inf values
     assert torch.isfinite(loss), "Loss should be finite"
-    assert torch.isfinite(torch.tensor(metrics["base_loss"])), "Base loss should be finite"
+    assert torch.isfinite(torch.tensor(metrics["base_loss"])), (
+        "Base loss should be finite"
+    )
     assert torch.isfinite(torch.tensor(metrics["kd_loss"])), "KD loss should be finite"

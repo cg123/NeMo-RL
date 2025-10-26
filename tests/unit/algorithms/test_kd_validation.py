@@ -29,14 +29,14 @@ def test_kd_loss_temperature_validation():
     # Valid temperatures should work
     loss_fn = KnowledgeDistillationLoss(temperature=1.0)
     assert loss_fn.temperature == 1.0
-    
+
     loss_fn = KnowledgeDistillationLoss(temperature=5.0)
     assert loss_fn.temperature == 5.0
-    
+
     # Zero temperature should fail
     with pytest.raises(ValueError, match="Temperature must be positive"):
         KnowledgeDistillationLoss(temperature=0.0)
-    
+
     # Negative temperature should fail
     with pytest.raises(ValueError, match="Temperature must be positive"):
         KnowledgeDistillationLoss(temperature=-1.0)
@@ -46,21 +46,21 @@ def test_combined_kd_loss_alpha_validation():
     """Test that CombinedKDLoss rejects invalid alpha values."""
     base_loss = NLLLoss()
     kd_loss = KnowledgeDistillationLoss(temperature=2.0)
-    
+
     # Valid alphas should work
     combined = CombinedKDLoss(base_loss, kd_loss, alpha=0.0)
     assert combined.alpha == 0.0
-    
+
     combined = CombinedKDLoss(base_loss, kd_loss, alpha=0.5)
     assert combined.alpha == 0.5
-    
+
     combined = CombinedKDLoss(base_loss, kd_loss, alpha=1.0)
     assert combined.alpha == 1.0
-    
+
     # Alpha > 1 should fail
     with pytest.raises(ValueError, match="Alpha must be in"):
         CombinedKDLoss(base_loss, kd_loss, alpha=1.5)
-    
+
     # Alpha < 0 should fail
     with pytest.raises(ValueError, match="Alpha must be in"):
         CombinedKDLoss(base_loss, kd_loss, alpha=-0.1)
@@ -79,13 +79,13 @@ def test_combined_kd_loss_alpha_validation():
 # def test_kd_trainer_rejects_teacher_vocab_parallelism():
 #     config = create_minimal_kd_config()
 #     config["teacher"]["tensor_parallel_size"] = 2
-#     
+#
 #     with pytest.raises(NotImplementedError, match="vocab parallelism"):
 #         trainer = KDTrainer(config, tokenizer, train_ds, val_ds)
 #
 # def test_kd_trainer_rejects_student_vocab_parallelism():
 #     config = create_minimal_kd_config()
 #     config["student_policy"]["dtensor_v2_cfg"]["tensor_parallel_size"] = 2
-#     
+#
 #     with pytest.raises(NotImplementedError, match="vocab parallelism"):
 #         trainer = KDTrainer(config, tokenizer, train_ds, val_ds)

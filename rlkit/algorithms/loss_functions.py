@@ -162,7 +162,14 @@ class ClippedPGLossFn(LossFunction):
             )
             next_tokens = data["input_ids"][:, 1:].cuda()  # Skip first token
             if next_tokens.dtype != torch.int64:
-                raise ValueError("next_tokens must be of type int64, got " + str(next_tokens.dtype) + " with shape " + str(next_tokens.shape) + " and " + str(next_tokens))
+                raise ValueError(
+                    "next_tokens must be of type int64, got "
+                    + str(next_tokens.dtype)
+                    + " with shape "
+                    + str(next_tokens.shape)
+                    + " and "
+                    + str(next_tokens)
+                )
             curr_logprobs = next_token_logprobs.gather(
                 dim=-1, index=next_tokens.unsqueeze(-1)
             ).squeeze(-1)
@@ -170,7 +177,9 @@ class ClippedPGLossFn(LossFunction):
         # Calculate KL regularization.
         if self.reference_policy_kl_penalty != 0:
             if reference_policy_logprobs is None:
-                raise ValueError("reference_policy_logprobs is required when reference_policy_kl_penalty is nonzero")
+                raise ValueError(
+                    "reference_policy_logprobs is required when reference_policy_kl_penalty is nonzero"
+                )
 
             if self.use_on_policy_kl_approximation:
                 # See: docs/guides/grpo.md#on-policy-kl-approximation
@@ -292,7 +301,7 @@ class ClippedPGLossFn(LossFunction):
                 mask,
                 global_normalization_factor=global_valid_toks,
             ).item()
-        
+
         # token_mult_prob_error
         # See more details and other metrics in docs/guides/grpo.md#metrics
         lp_error = torch.abs(generation_logprobs - prev_logprobs)  # noqa: F841  (precommit ignore for now)
@@ -575,22 +584,22 @@ class SequencePackingLossWrapper:
 
 class KnowledgeDistillationLoss(LossFunction):
     """KL divergence loss for knowledge distillation.
-    
+
     Computes KL(teacher || student) using log probabilities from the teacher.
     Uses temperature scaling as in Hinton et al. (2015).
-    
+
     Note: This implementation expects teacher log probabilities (not raw logits)
     because the Policy.get_logprobs() interface returns log probabilities.
-    
+
     Formula:
         KL = sum_i [ P_teacher(i) * log(P_teacher(i) / P_student(i)) ]
-    
+
     where:
     - P_teacher are probabilities derived from teacher log probabilities
     - P_student are softmax probabilities from student logits with temperature T
     - The loss is scaled by T^2 to preserve gradient magnitudes (standard in KD)
     """
-    
+
     def __init__(self, temperature: float = 1.0):
         if temperature <= 0:
             raise ValueError(
@@ -600,7 +609,7 @@ class KnowledgeDistillationLoss(LossFunction):
             )
         self.temperature = temperature
         self.loss_type = LossType.TOKEN_LEVEL
-    
+
     def __call__(
         self,
         next_token_logits: Tensor,
@@ -612,7 +621,7 @@ class KnowledgeDistillationLoss(LossFunction):
         context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         """Compute KL divergence between student logits and teacher log probabilities.
-        
+
         Args:
             next_token_logits: Student model logits [batch, seq_len, vocab]
             data: BatchedDataDict containing:
@@ -624,25 +633,27 @@ class KnowledgeDistillationLoss(LossFunction):
             vocab_parallel_rank: Rank in vocab parallel group (if using TP)
             vocab_parallel_group: Process group for vocab parallelism
             context_parallel_group: Process group for context parallelism
-        
+
         Returns:
             tuple of (loss, metrics_dict)
         """
         # Cast to float32 for numerical stability with log operations
         next_token_logits = next_token_logits.float()
-        
+
         # Get teacher log probabilities from data dict
         teacher_logprobs = data["teacher_logprobs"]
         if teacher_logprobs.dtype != torch.float32:
             teacher_logprobs = teacher_logprobs.float()
-        
+
         token_mask = data["token_mask"][:, 1:]  # Skip first token (no prediction)
         sample_mask = data["sample_mask"]
-        
+
         # Apply temperature scaling to student logits
         T = self.temperature
-        student_log_probs = torch.nn.functional.log_softmax(next_token_logits / T, dim=-1)
-        
+        student_log_probs = torch.nn.functional.log_softmax(
+            next_token_logits / T, dim=-1
+        )
+
         # Apply temperature scaling to teacher log probabilities
         # We have teacher_logprobs = log(P), so to apply temperature:
         # - Scale in log space: log(P) / T = log(P^(1/T))
@@ -652,22 +663,22 @@ class KnowledgeDistillationLoss(LossFunction):
         teacher_logprobs_normalized = teacher_logprobs_temp_scaled - torch.logsumexp(
             teacher_logprobs_temp_scaled, dim=-1, keepdim=True
         )
-        
+
         # Compute KL divergence in log space for numerical stability
         kl_div = torch.nn.functional.kl_div(
-            student_log_probs, 
-            teacher_logprobs_normalized, 
-            reduction='none',
-            log_target=True  # Both student and teacher are log probabilities
+            student_log_probs,
+            teacher_logprobs_normalized,
+            reduction="none",
+            log_target=True,  # Both student and teacher are log probabilities
         )
-        
+
         # Sum over vocabulary dimension
         kl_div = kl_div.sum(dim=-1)  # [batch, seq_len]
-        
+
         # Scale by T^2 to preserve gradient magnitudes (Hinton et al. 2015)
-        kl_div = kl_div * (T ** 2)
+        kl_div = kl_div * (T**2)
         # This ensures distillation loss magnitude is comparable to base loss
-        
+
         # Apply token-level masking
         masked_kl = masked_mean(
             kl_div,
@@ -675,7 +686,7 @@ class KnowledgeDistillationLoss(LossFunction):
             sample_mask,
             global_normalization_factor=global_valid_toks,
         )
-        
+
         return masked_kl, {
             "kd_loss": masked_kl.item(),
             "temperature": T,
@@ -684,23 +695,23 @@ class KnowledgeDistillationLoss(LossFunction):
 
 class CombinedKDLoss(LossFunction):
     """Combines base supervised loss with KD loss.
-    
+
     total_loss = (1 - α) * base_loss + α * kd_loss
-    
+
     where α is the alpha parameter.
-    
+
     This allows training with both ground truth labels (base_loss) and
     teacher model outputs (kd_loss) simultaneously.
     """
-    
+
     def __init__(
-        self, 
+        self,
         base_loss: LossFunction,
         kd_loss: KnowledgeDistillationLoss,
         alpha: float,
     ):
         """Initialize combined loss.
-        
+
         Args:
             base_loss: Base supervised loss (e.g., NLLLoss)
             kd_loss: Knowledge distillation loss function
@@ -718,7 +729,7 @@ class CombinedKDLoss(LossFunction):
             )
         self.alpha = alpha
         self.loss_type = base_loss.loss_type  # Inherit from base loss
-    
+
     def __call__(
         self,
         next_token_logits: Tensor,
@@ -730,7 +741,7 @@ class CombinedKDLoss(LossFunction):
         context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         """Compute combined loss.
-        
+
         Args:
             next_token_logits: Student model logits
             data: BatchedDataDict with labels and teacher_logprobs
@@ -739,7 +750,7 @@ class CombinedKDLoss(LossFunction):
             vocab_parallel_rank: Vocab parallel rank
             vocab_parallel_group: Vocab parallel process group
             context_parallel_group: Context parallel process group
-        
+
         Returns:
             tuple of (combined_loss, metrics_dict)
         """
@@ -753,7 +764,7 @@ class CombinedKDLoss(LossFunction):
             vocab_parallel_group,
             context_parallel_group,
         )
-        
+
         # Teacher log probabilities must be provided for KD training
         if "teacher_logprobs" not in data or data["teacher_logprobs"] is None:
             raise ValueError(
@@ -762,7 +773,7 @@ class CombinedKDLoss(LossFunction):
                 "In KDTrainer, ensure _get_teacher_logprobs() is called and the result is "
                 "added to the data dict before calling student_policy.train()."
             )
-        
+
         kd_loss_val, kd_metrics = self.kd_loss(
             next_token_logits,
             data,
@@ -772,10 +783,10 @@ class CombinedKDLoss(LossFunction):
             vocab_parallel_group,
             context_parallel_group,
         )
-        
+
         # Combine losses: (1-α)*base + α*kd
         total_loss = (1 - self.alpha) * base_loss_val + self.alpha * kd_loss_val
-        
+
         metrics = {
             **base_metrics,
             **kd_metrics,
@@ -783,5 +794,5 @@ class CombinedKDLoss(LossFunction):
             "alpha": self.alpha,
             "total_loss": total_loss.item(),
         }
-        
+
         return total_loss, metrics
