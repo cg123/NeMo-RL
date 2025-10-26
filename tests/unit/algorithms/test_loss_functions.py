@@ -861,7 +861,7 @@ def test_clipped_pg_loss_entropy():
 
 
 def test_knowledge_distillation_loss_basic():
-    """Test KnowledgeDistillationLoss with basic inputs."""
+    """Test KnowledgeDistillationLoss with basic inputs (using log probabilities)."""
     if not torch.cuda.is_available():
         pytest.skip("No GPU available")
 
@@ -883,9 +883,10 @@ def test_knowledge_distillation_loss_basic():
     # Student logits (random)
     student_logits = torch.randn(batch_size, seq_len, vocab_size, device=device)
     
-    # Teacher logits (similar but slightly different)
-    teacher_logits = student_logits + torch.randn(batch_size, seq_len, vocab_size, device=device) * 0.1
-    data["teacher_logits"] = teacher_logits
+    # Teacher log probabilities (convert from similar logits)
+    teacher_logits_raw = student_logits + torch.randn(batch_size, seq_len, vocab_size, device=device) * 0.1
+    teacher_logprobs = torch.nn.functional.log_softmax(teacher_logits_raw, dim=-1)
+    data["teacher_logprobs"] = teacher_logprobs
     
     # Compute loss
     loss, metrics = loss_fn(
@@ -903,7 +904,7 @@ def test_knowledge_distillation_loss_basic():
 
 
 def test_knowledge_distillation_loss_temperature_scaling():
-    """Test that temperature scaling works correctly."""
+    """Test that temperature scaling works correctly with log probabilities."""
     if not torch.cuda.is_available():
         pytest.skip("No GPU available")
 
@@ -920,8 +921,9 @@ def test_knowledge_distillation_loss_temperature_scaling():
     
     # Create distinct logits
     student_logits = torch.tensor([[[10.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]]], device=device)
-    teacher_logits = torch.tensor([[[1.0, 10.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]]], device=device)
-    data["teacher_logits"] = teacher_logits
+    teacher_logits_raw = torch.tensor([[[1.0, 10.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]]], device=device)
+    teacher_logprobs = torch.nn.functional.log_softmax(teacher_logits_raw, dim=-1)
+    data["teacher_logprobs"] = teacher_logprobs
     
     # Test with different temperatures
     loss_t1 = KnowledgeDistillationLoss(temperature=1.0)(
@@ -944,7 +946,7 @@ def test_knowledge_distillation_loss_temperature_scaling():
 
 
 def test_knowledge_distillation_loss_masking():
-    """Test that masking is correctly applied."""
+    """Test that masking is correctly applied with log probabilities."""
     if not torch.cuda.is_available():
         pytest.skip("No GPU available")
 
@@ -963,9 +965,10 @@ def test_knowledge_distillation_loss_masking():
     
     # Create logits where first token has huge difference (should be ignored)
     student_logits = torch.randn(1, 3, vocab_size, device=device)
-    teacher_logits = student_logits.clone()
-    teacher_logits[0, 0, :] = teacher_logits[0, 0, :] + 1000.0  # Huge difference in masked token
-    data["teacher_logits"] = teacher_logits
+    teacher_logits_raw = student_logits.clone()
+    teacher_logits_raw[0, 0, :] = teacher_logits_raw[0, 0, :] + 1000.0  # Huge difference in masked token
+    teacher_logprobs = torch.nn.functional.log_softmax(teacher_logits_raw, dim=-1)
+    data["teacher_logprobs"] = teacher_logprobs
     
     loss_masked, _ = loss_fn(
         student_logits, data,
@@ -985,7 +988,7 @@ def test_knowledge_distillation_loss_masking():
 
 
 def test_knowledge_distillation_loss_missing_teacher_logits():
-    """Test that missing teacher_logits raises an error."""
+    """Test that missing teacher_logprobs raises an error."""
     if not torch.cuda.is_available():
         pytest.skip("No GPU available")
 
@@ -999,7 +1002,7 @@ def test_knowledge_distillation_loss_missing_teacher_logits():
         "token_mask": torch.tensor([[1, 1]], device=device),
         "sample_mask": torch.tensor([1], device=device),
         "num_valid_tokens_in_batch": torch.tensor([2]),
-        # Note: teacher_logits is missing
+        # Note: teacher_logprobs is missing
     }
     
     student_logits = torch.randn(1, 2, vocab_size, device=device)
@@ -1009,7 +1012,7 @@ def test_knowledge_distillation_loss_missing_teacher_logits():
 
 
 def test_combined_kd_loss_alpha_blending():
-    """Test that CombinedKDLoss correctly blends base and KD losses."""
+    """Test that CombinedKDLoss correctly blends base and KD losses with log probabilities."""
     if not torch.cuda.is_available():
         pytest.skip("No GPU available")
 
@@ -1032,8 +1035,9 @@ def test_combined_kd_loss_alpha_blending():
         }
         
         student_logits = torch.randn(1, 4, vocab_size, device=device)
-        teacher_logits = torch.randn(1, 4, vocab_size, device=device)
-        data["teacher_logits"] = teacher_logits
+        teacher_logits_raw = torch.randn(1, 4, vocab_size, device=device)
+        teacher_logprobs = torch.nn.functional.log_softmax(teacher_logits_raw, dim=-1)
+        data["teacher_logprobs"] = teacher_logprobs
         
         # Compute combined loss
         total_loss, metrics = combined_loss(
@@ -1058,7 +1062,7 @@ def test_combined_kd_loss_alpha_blending():
 
 
 def test_combined_kd_loss_missing_teacher_logits():
-    """Test that CombinedKDLoss raises helpful error when teacher_logits missing."""
+    """Test that CombinedKDLoss raises helpful error when teacher_logprobs missing."""
     if not torch.cuda.is_available():
         pytest.skip("No GPU available")
 
@@ -1074,7 +1078,7 @@ def test_combined_kd_loss_missing_teacher_logits():
         "token_mask": torch.tensor([[1, 1]], device=device),
         "sample_mask": torch.tensor([1], device=device),
         "num_valid_tokens_in_batch": torch.tensor([2]),
-        # Note: teacher_logits is intentionally missing
+        # Note: teacher_logprobs is intentionally missing
     }
     
     student_logits = torch.randn(1, 2, vocab_size, device=device)
@@ -1083,12 +1087,12 @@ def test_combined_kd_loss_missing_teacher_logits():
     with pytest.raises(ValueError) as exc_info:
         combined_loss(student_logits, data, global_valid_seqs=1, global_valid_toks=2)
     
-    assert "teacher_logits must be provided" in str(exc_info.value)
+    assert "teacher_logprobs must be provided" in str(exc_info.value)
     assert "KDTrainer" in str(exc_info.value)  # Error message should mention where to fix
 
 
 def test_combined_kd_loss_numerical_stability():
-    """Test that CombinedKDLoss handles extreme values gracefully."""
+    """Test that CombinedKDLoss handles extreme values gracefully with log probabilities."""
     if not torch.cuda.is_available():
         pytest.skip("No GPU available")
 
@@ -1108,8 +1112,9 @@ def test_combined_kd_loss_numerical_stability():
     
     # Test with very large logits (should not cause overflow)
     student_logits = torch.randn(1, 3, vocab_size, device=device) * 100
-    teacher_logits = torch.randn(1, 3, vocab_size, device=device) * 100
-    data["teacher_logits"] = teacher_logits
+    teacher_logits_raw = torch.randn(1, 3, vocab_size, device=device) * 100
+    teacher_logprobs = torch.nn.functional.log_softmax(teacher_logits_raw, dim=-1)
+    data["teacher_logprobs"] = teacher_logprobs
     
     loss, metrics = combined_loss(
         student_logits, data,

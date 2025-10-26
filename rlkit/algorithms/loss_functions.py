@@ -576,13 +576,19 @@ class SequencePackingLossWrapper:
 class KnowledgeDistillationLoss(LossFunction):
     """KL divergence loss for knowledge distillation.
     
-    Computes KL(teacher || student) on softened logits.
+    Computes KL(teacher || student) using log probabilities from the teacher.
     Uses temperature scaling as in Hinton et al. (2015).
     
-    Formula:
-        KL = sum_i [ P_teacher(i) * log(P_teacher(i) / P_student(i)) ] * T^2
+    Note: This implementation expects teacher log probabilities (not raw logits)
+    because the Policy.get_logprobs() interface returns log probabilities.
     
-    where P are softmax probabilities with temperature T.
+    Formula:
+        KL = sum_i [ P_teacher(i) * log(P_teacher(i) / P_student(i)) ]
+    
+    where:
+    - P_teacher are probabilities derived from teacher log probabilities
+    - P_student are softmax probabilities from student logits with temperature T
+    - The loss is scaled by T^2 to preserve gradient magnitudes (standard in KD)
     """
     
     def __init__(self, temperature: float = 1.0):
@@ -599,12 +605,12 @@ class KnowledgeDistillationLoss(LossFunction):
         vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
         context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
-        """Compute KL divergence between student and teacher logits.
+        """Compute KL divergence between student logits and teacher log probabilities.
         
         Args:
             next_token_logits: Student model logits [batch, seq_len, vocab]
             data: BatchedDataDict containing:
-                - teacher_logits: Teacher model logits [batch, seq_len, vocab]
+                - teacher_logprobs: Teacher log probabilities [batch, seq_len, vocab]
                 - token_mask: Mask for valid tokens [batch, seq_len]
                 - sample_mask: Mask for valid samples [batch]
             global_valid_seqs: Number of valid sequences for normalization
@@ -616,28 +622,36 @@ class KnowledgeDistillationLoss(LossFunction):
         Returns:
             tuple of (loss, metrics_dict)
         """
-        # Cast to float32 for numerical stability
-        # Note: While PyTorch's F.kl_div handles mixed precision inputs,
-        # we explicitly cast to float32 here to ensure consistent numerical
-        # behavior across different hardware and to avoid potential precision
-        # issues when computing log probabilities (log of small numbers).
+        # Cast to float32 for numerical stability with log operations
         next_token_logits = next_token_logits.float()
         
-        # Get teacher logits from data dict
-        teacher_logits = data["teacher_logits"]
-        if teacher_logits.dtype != torch.float32:
-            teacher_logits = teacher_logits.float()
+        # Get teacher log probabilities from data dict
+        teacher_logprobs = data["teacher_logprobs"]
+        if teacher_logprobs.dtype != torch.float32:
+            teacher_logprobs = teacher_logprobs.float()
         
         token_mask = data["token_mask"][:, 1:]  # Skip first token (no prediction)
         sample_mask = data["sample_mask"]
         
-        # Apply temperature scaling
+        # Apply temperature scaling to student logits
         T = self.temperature
         student_log_probs = torch.nn.functional.log_softmax(next_token_logits / T, dim=-1)
-        teacher_probs = torch.nn.functional.softmax(teacher_logits / T, dim=-1)
         
-        # Compute KL divergence: KL(P||Q) = sum(P * log(P/Q))
-        # Using log_softmax for numerical stability
+        # Apply temperature scaling to teacher log probabilities
+        # We have teacher_logprobs = log(P), so:
+        # - Divide by T in log space: log(P) / T = log(P^(1/T))
+        # - Then renormalize since division changes the distribution
+        teacher_logprobs_scaled = teacher_logprobs / T
+        
+        # Renormalize after temperature scaling (log-space trick for stability)
+        # log(P_scaled) = log(P^(1/T)) - log(sum(P^(1/T)))
+        #               = log(P)/T - log_sum_exp(log(P)/T)
+        teacher_logprobs_scaled = teacher_logprobs_scaled - torch.logsumexp(
+            teacher_logprobs_scaled, dim=-1, keepdim=True
+        )
+        teacher_probs = torch.exp(teacher_logprobs_scaled)
+        
+        # Compute KL divergence: KL(P||Q) = sum(P * log(P/Q)) = sum(P * (log(P) - log(Q)))
         kl_div = torch.nn.functional.kl_div(
             student_log_probs, 
             teacher_probs, 
@@ -731,9 +745,9 @@ class CombinedKDLoss(LossFunction):
         )
         
         # Teacher logits must be provided for KD training
-        if "teacher_logits" not in data or data["teacher_logits"] is None:
+        if "teacher_logprobs" not in data or data["teacher_logprobs"] is None:
             raise ValueError(
-                "teacher_logits must be provided in data dict for CombinedKDLoss. "
+                "teacher_logprobs must be provided in data dict for CombinedKDLoss. "
                 "This indicates that teacher inference was not run before student training. "
                 "In KDTrainer, ensure _get_teacher_logits() is called and the result is "
                 "added to the data dict before calling student_policy.train()."

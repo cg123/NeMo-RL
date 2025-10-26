@@ -529,23 +529,24 @@ class KDTrainer:
     async def _get_teacher_logits(
         self, data: BatchedDataDict
     ) -> torch.Tensor:
-        """Get teacher logits for the batch (synchronous inference).
+        """Get teacher log probabilities for the batch (synchronous inference).
+        
+        Note: Despite the name, Policy.get_logprobs() returns log probabilities,
+        not raw logits, because vLLM (the inference backend) doesn't expose logits.
         
         Returns:
-            teacher_logits: Logits from teacher model [batch, seq_len, vocab]
+            teacher_logprobs: Log probabilities from teacher [batch, seq_len, vocab]
         """
         # Prepare teacher for logprob inference
         self.teacher_policy.prepare_for_lp_inference()
         
-        # Get teacher logits
-        # Note: get_logprobs() actually returns logits, not log probabilities
-        # (the naming in the interface is a misnomer)
+        # Get teacher log probabilities
         teacher_output = self.teacher_policy.get_logprobs(data)
         
-        # Extract logits from output dict
-        teacher_logits = teacher_output["logprobs"]  # Actually logits
+        # Extract log probabilities from output dict
+        teacher_logprobs = teacher_output["logprobs"]
         
-        return teacher_logits
+        return teacher_logprobs
     
     async def validate(
         self, step: int
@@ -579,9 +580,9 @@ class KDTrainer:
                 # Process batch
                 val_data = self._process_batch(val_batch)
                 
-                # Get teacher logits
-                teacher_logits = await self._get_teacher_logits(val_data)
-                val_data["teacher_logits"] = teacher_logits
+                # Get teacher log probabilities
+                teacher_logprobs = await self._get_teacher_logits(val_data)
+                val_data["teacher_logprobs"] = teacher_logprobs
                 
                 # Run validation (eval_mode=True, no gradient updates)
                 val_results = await self.student_policy.train(
@@ -696,8 +697,8 @@ class KDTrainer:
                     # 2. Get teacher logits (synchronous)
                     logging.info("Computing teacher logits...")
                     with timer.time("teacher_inference"):
-                        teacher_logits = await self._get_teacher_logits(train_data)
-                        train_data["teacher_logits"] = teacher_logits
+                        teacher_logprobs = await self._get_teacher_logits(train_data)
+                        train_data["teacher_logprobs"] = teacher_logprobs
                     
                     # 3. Train student
                     logging.info("Training student policy...")
