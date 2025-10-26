@@ -6,7 +6,7 @@ This document explains the design and implementation of the knowledge distillati
 
 Knowledge distillation allows a smaller **student** model to learn from a larger **teacher** model by minimizing the KL divergence between their output distributions. This implementation follows NeMo RL's existing patterns (similar to SFT/GRPO) and supports:
 
-- **Online distillation**: Teacher generates logits on-the-fly during training
+- **Online distillation**: Teacher generates log probabilities on-the-fly during training
 - **Dedicated clusters**: Separate GPU allocation for teacher and student
 - **Flexible architectures**: Teacher and student can be different models/sizes
 - **Combined loss**: Mix supervised learning with distillation
@@ -91,19 +91,24 @@ class KDConfig(TypedDict):
 
 ### KnowledgeDistillationLoss
 
-**Purpose**: Compute KL divergence between teacher and student logits
+**Purpose**: Compute KL divergence between teacher and student log probabilities
 
 **Implementation**:
 
 ```python
 class KnowledgeDistillationLoss(LossFunction):
     def __call__(self, student_logits, data, ...):
-        teacher_logits = data["teacher_logits"]
+        teacher_logprobs = data["teacher_logprobs"]
         
         # Temperature scaling
         T = self.temperature
         student_log_probs = F.log_softmax(student_logits / T, dim=-1)
-        teacher_probs = F.softmax(teacher_logits / T, dim=-1)
+        # Convert teacher log probs to probs with temperature scaling
+        teacher_logprobs_scaled = teacher_logprobs / T
+        teacher_logprobs_scaled = teacher_logprobs_scaled - torch.logsumexp(
+            teacher_logprobs_scaled, dim=-1, keepdim=True
+        )
+        teacher_probs = torch.exp(teacher_logprobs_scaled)
         
         # KL divergence
         kl_div = F.kl_div(student_log_probs, teacher_probs, reduction='none')
@@ -134,9 +139,9 @@ class CombinedKDLoss(LossFunction):
         # Base supervised loss (e.g., cross-entropy)
         base_loss, base_metrics = self.base_loss(student_logits, data, ...)
         
-        # KD loss (fails loudly if teacher_logits missing)
-        if "teacher_logits" not in data:
-            raise ValueError("teacher_logits must be provided")
+        # KD loss (fails loudly if teacher_logprobs missing)
+        if "teacher_logprobs" not in data:
+            raise ValueError("teacher_logprobs must be provided")
         
         kd_loss, kd_metrics = self.kd_loss(student_logits, data, ...)
         
@@ -148,7 +153,7 @@ class CombinedKDLoss(LossFunction):
 
 **Key aspects**:
 - **Composition pattern**: Wraps any base loss (NLLLoss, etc.)
-- **Fail loudly**: Raises ValueError if teacher logits missing
+- **Fail loudly**: Raises ValueError if teacher log probabilities missing
 - **Comprehensive metrics**: Returns base_loss, kd_loss, total_loss
 - **Inherits loss_type**: From base loss (token-level or sequence-level)
 
@@ -245,10 +250,10 @@ async def train(self):
             # 1. Process batch (tokenize, pad, mask)
             train_data = self._process_batch(batch)
             
-            # 2. Get teacher logits (synchronous)
-            teacher_logits = await self._get_teacher_logits(train_data)
-            train_data["teacher_logits"] = teacher_logits
-            
+            # 2. Get teacher log probabilities (synchronous)
+            teacher_logprobs = await self._get_teacher_logprobs(train_data)
+            train_data["teacher_logprobs"] = teacher_logprobs
+
             # 3. Train student (forward + backward)
             train_results = await self.student_policy.train(
                 train_data, 
@@ -272,21 +277,21 @@ async def train(self):
 - Simple, correct, no race conditions
 - Future: Can add pipelining (teacher for batch N+1 while training batch N)
 
-### Teacher Logit Computation
+### Teacher Log Probability Computation
 
 ```python
-async def _get_teacher_logits(self, data: BatchedDataDict) -> torch.Tensor:
+async def _get_teacher_logprobs(self, data: BatchedDataDict) -> torch.Tensor:
     # Prepare teacher for inference
     self.teacher_policy.prepare_for_lp_inference()
     
-    # Get logits (note: get_logprobs is misnomer, returns logits)
+    # Get log probabilities from teacher policy
     teacher_output = self.teacher_policy.get_logprobs(data)
-    teacher_logits = teacher_output["logprobs"]  # Actually logits
+    teacher_logprobs = teacher_output["logprobs"]
     
-    return teacher_logits
+    return teacher_logprobs
 ```
 
-**Note**: The `get_logprobs()` interface is misnamed in NeMo RL - it actually returns logits, not log probabilities.
+**Note**: The `get_logprobs()` interface correctly returns log probabilities, not raw logits.
 
 ## Checkpointing
 
@@ -363,7 +368,7 @@ Follows SFT's `_process_batch` implementation exactly.
 
 ### In Policy Worker
 
-The policy worker computes logits and calls the loss function:
+The policy worker computes logits from the model and calls the loss function:
 
 ```python
 # In v2_policy_worker.py (existing code, no changes needed)
@@ -371,7 +376,7 @@ def train_step(data, loss_fn):
     logits = model(data["input_ids"])  # Forward pass
     loss, metrics = loss_fn(
         logits,                        # Student logits
-        data,                          # Includes teacher_logits
+        data,                          # Includes teacher_logprobs
         global_valid_seqs,
         global_valid_toks,
     )
@@ -386,9 +391,9 @@ def CombinedKDLoss.__call__(student_logits, data, ...):
     base_loss = NLLLoss(student_logits, data["labels"], ...)
     
     # 2. Compute KD loss
-    teacher_logits = data["teacher_logits"]  # From KDTrainer
-    kd_loss = KL_divergence(student_logits, teacher_logits, T)
-    
+    teacher_logprobs = data["teacher_logprobs"]  # From KDTrainer
+    kd_loss = KL_divergence(student_logits, teacher_logprobs, T)
+
     # 3. Combine
     total_loss = (1 - α) * base_loss + α * kd_loss
     
@@ -409,7 +414,7 @@ Teacher: Forward only (no backward)
       Gradients → Student only
 ```
 
-Teacher is frozen, so `teacher_logits` are detached from computation graph.
+Teacher is frozen, so `teacher_logprobs` are detached from computation graph.
 
 ## Distributed Training
 
@@ -514,10 +519,10 @@ def validate(self, step):
         # 1. Process batch
         val_data = self._process_batch(val_batch)
         
-        # 2. Get teacher logits
-        teacher_logits = await self._get_teacher_logits(val_data)
-        val_data["teacher_logits"] = teacher_logits
-        
+        # 2. Get teacher log probabilities
+        teacher_logprobs = await self._get_teacher_logprobs(val_data)
+        val_data["teacher_logprobs"] = teacher_logprobs
+
         # 3. Run student in eval mode (no gradient updates)
         val_results = await self.student_policy.train(
             val_data,
@@ -582,7 +587,7 @@ Example output during training:
 ```
 ========================= Step 1 =========================
 Processing batch...
-Computing teacher logits...
+Computing teacher log probabilities...
 Training student policy...
 
 📊 Training Results:
@@ -604,7 +609,7 @@ Training student policy...
 
 ### Planned Features
 
-1. **Offline distillation**: Pre-compute teacher logits, cache to disk
+1. **Offline distillation**: Pre-compute teacher log probabilities, cache to disk
    - Faster training (no teacher inference overhead)
    - Enables using very large teachers without GPU cost
 
@@ -676,11 +681,11 @@ We chose a **standalone algorithm** (`kd.py`) instead of adding KD as a feature 
 
 Future: Could create `kd_grpo.py` for RL + distillation if needed.
 
-### Why Fail Loudly on Missing Teacher Logits?
+### Why Fail Loudly on Missing Teacher Log Probabilities?
 
-Original design had graceful fallback (use base loss only if teacher logits missing). We changed this to **fail loudly** because:
+Original design had graceful fallback (use base loss only if teacher log probabilities missing). We changed this to **fail loudly** because:
 
-✅ **Catches bugs immediately**: Missing teacher logits indicates pipeline error
+✅ **Catches bugs immediately**: Missing teacher log probabilities indicates pipeline error
 ✅ **Clear intent**: If using KD, teacher must be present
 ✅ **No silent degradation**: Training doesn't silently become pure SFT
 

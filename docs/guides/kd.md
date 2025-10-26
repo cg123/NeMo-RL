@@ -49,15 +49,19 @@ L_total = (1 - α) * L_supervised + α * L_KD
 
 Where:
 - **L_supervised**: Standard cross-entropy with ground truth labels
-- **L_KD**: KL divergence between student and teacher logits (softened by temperature)
+- **L_KD**: KL divergence between student and teacher log probabilities (softened by temperature)
 - **α** (alpha): Balances the two losses (0 = pure supervised, 1 = pure distillation)
 
 ### Temperature Scaling
 
-Logits are softened using temperature **T** before computing KL divergence:
+Log probabilities are softened using temperature **T** before computing KL divergence:
 
 ```
-p_teacher = softmax(logits_teacher / T)
+# Teacher already provides log probabilities
+p_teacher_scaled = logprobs_teacher / T  # Temperature scaling in log space
+p_teacher = exp(p_teacher_scaled - logsumexp(p_teacher_scaled))  # Renormalize
+
+# Student provides logits, apply softmax with temperature
 p_student = log_softmax(logits_student / T)
 L_KD = KL(p_teacher || p_student) * T²
 ```
@@ -452,7 +456,7 @@ During training, you'll see detailed logs:
 ```
 ========================= Step 1 =========================
 Processing batch...
-Computing teacher logits...
+Computing teacher log probabilities...
 Training student policy...
 
 📊 Training Results:
@@ -549,7 +553,7 @@ Compare `val_loss` with different `alpha` and `temperature` values.
 #### Tokenizer Mismatch
 
 ```
-ValueError: teacher_logits must be provided in data dict for CombinedKDLoss
+ValueError: teacher_logprobs must be provided in data dict for CombinedKDLoss
 ```
 
 **Cause**: Student and teacher use incompatible tokenizers

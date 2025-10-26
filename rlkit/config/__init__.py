@@ -24,6 +24,7 @@ from .kd import (
     TeacherClusterConfig,
     KD_DEFAULT_ALPHA,
     KD_DEFAULT_TEMPERATURE,
+    KD_DEFAULT_TEACHER_LOGPROBS_FP16,
     KD_DEFAULT_VAL_PERIOD,
     KD_DEFAULT_VAL_AT_START,
 )
@@ -59,6 +60,7 @@ __all__ = [
     "TeacherClusterConfig",
     "KD_DEFAULT_ALPHA",
     "KD_DEFAULT_TEMPERATURE",
+    "KD_DEFAULT_TEACHER_LOGPROBS_FP16",
     "KD_DEFAULT_VAL_PERIOD",
     "KD_DEFAULT_VAL_AT_START",
 ]

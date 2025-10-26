@@ -280,6 +280,48 @@ class KDTrainer:
         
         return train_dataloader, val_dataloader
     
+    def _validate_cluster_allocation(
+        self, cluster_config: ClusterConfig, teacher_cluster_config: dict
+    ) -> None:
+        """Validate that cluster resources are properly allocated.
+        
+        Ensures that teacher + student don't exceed total available resources.
+        
+        Args:
+            cluster_config: Total cluster resources
+            teacher_cluster_config: Teacher's dedicated cluster allocation
+            
+        Raises:
+            ValueError: If resource allocation is invalid
+        """
+        total_gpus = cluster_config["num_nodes"] * cluster_config["gpus_per_node"]
+        teacher_gpus = teacher_cluster_config["num_nodes"] * teacher_cluster_config["gpus_per_node"]
+        student_gpus = total_gpus - teacher_gpus
+        
+        if teacher_gpus <= 0:
+            raise ValueError(
+                f"Teacher cluster allocation is invalid: {teacher_gpus} GPUs. "
+                "Must allocate at least 1 GPU for teacher."
+            )
+        
+        if student_gpus <= 0:
+            raise ValueError(
+                f"No GPUs available for student after allocating {teacher_gpus} GPUs to teacher. "
+                f"Total cluster has {total_gpus} GPUs. "
+                "Please increase total cluster size or decrease teacher cluster allocation."
+            )
+        
+        if teacher_gpus > total_gpus:
+            raise ValueError(
+                f"Teacher cluster allocation ({teacher_gpus} GPUs) exceeds total "
+                f"cluster resources ({total_gpus} GPUs)."
+            )
+        
+        logging.info(f"✓ Cluster allocation validated:")
+        logging.info(f"  • Total GPUs: {total_gpus}")
+        logging.info(f"  • Teacher GPUs: {teacher_gpus}")
+        logging.info(f"  • Student GPUs: {student_gpus}")
+    
     def _setup_clusters(
         self,
         cluster_config: ClusterConfig,
@@ -526,12 +568,12 @@ class KDTrainer:
         
         return BatchedDataDict({k: torch.stack(v) for k, v in train_data.items()})
     
-    async def _get_teacher_logits(
+    async def _get_teacher_logprobs(
         self, data: BatchedDataDict
     ) -> torch.Tensor:
-        """Get teacher log probabilities for the batch (synchronous inference).
+        """Get teacher log probabilities for the batch (teacher inference).
         
-        Note: Despite the name, Policy.get_logprobs() returns log probabilities,
+        Note: Policy.get_logprobs() returns log probabilities,
         not raw logits, because vLLM (the inference backend) doesn't expose logits.
         
         Returns:
@@ -545,6 +587,11 @@ class KDTrainer:
         
         # Extract log probabilities from output dict
         teacher_logprobs = teacher_output["logprobs"]
+        
+        # Optionally convert to fp16 to save memory (teacher logprobs can be large)
+        # For 32k vocab and 4096 seq len, this saves ~250MB per batch
+        if self.master_config["kd"].get("teacher_logprobs_fp16", False):
+            teacher_logprobs = teacher_logprobs.half()
         
         return teacher_logprobs
     
@@ -574,14 +621,18 @@ class KDTrainer:
             
             self.student_policy.prepare_for_training()
             
+            max_val_batches = kd_config.get("val_batches", -1)
             for batch_idx, raw_val_batch in enumerate(self.val_dataloader):
+                # Stop if we've reached the max validation batches
+                if max_val_batches > 0 and batch_idx >= max_val_batches:
+                    break
                 val_batch = BatchedDataDict(raw_val_batch)
                 
                 # Process batch
                 val_data = self._process_batch(val_batch)
                 
                 # Get teacher log probabilities
-                teacher_logprobs = await self._get_teacher_logits(val_data)
+                teacher_logprobs = await self._get_teacher_logprobs(val_data)
                 val_data["teacher_logprobs"] = teacher_logprobs
                 
                 # Run validation (eval_mode=True, no gradient updates)
@@ -697,7 +748,7 @@ class KDTrainer:
                     # 2. Get teacher logits (synchronous)
                     logging.info("Computing teacher logits...")
                     with timer.time("teacher_inference"):
-                        teacher_logprobs = await self._get_teacher_logits(train_data)
+                        teacher_logprobs = await self._get_teacher_logprobs(train_data)
                         train_data["teacher_logprobs"] = teacher_logprobs
                     
                     # 3. Train student

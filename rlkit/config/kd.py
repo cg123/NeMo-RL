@@ -10,6 +10,7 @@ from rlkit.config.checkpointing import CheckpointingConfig
 # Default values for optional KD parameters
 KD_DEFAULT_ALPHA = 0.5
 KD_DEFAULT_TEMPERATURE = 2.0
+KD_DEFAULT_TEACHER_LOGPROBS_FP16 = False
 KD_DEFAULT_VAL_PERIOD = 0
 KD_DEFAULT_VAL_AT_START = False
 
@@ -41,7 +42,15 @@ class TeacherConfig(TypedDict):
 
 
 class KDConfig(TypedDict):
-    """Configuration for knowledge distillation algorithm."""
+    """Configuration for knowledge distillation algorithm.
+    
+    Defaults:
+        alpha: 0.5
+        temperature: 2.0
+        teacher_logprobs_fp16: False
+        val_period: 0 (disabled)
+        val_at_start: False
+    """
     # Training limits
     max_num_steps: int
     max_num_epochs: int
@@ -55,6 +64,10 @@ class KDConfig(TypedDict):
     # Temperature for softening logits (Hinton et al. 2015)
     # Range: >= 1.0 where 1.0 = no softening, 2.0-4.0 = typical KD range
     temperature: NotRequired[float]  # Default: 2.0
+    
+    # Store teacher logprobs in fp16 to save memory (~50% reduction)
+    # Recommended for large vocabularies (>32k) or long sequences (>2048)
+    teacher_logprobs_fp16: NotRequired[bool]  # Default: False
     
     # Validation
     val_period: NotRequired[int]  # Default: 0 (disabled)

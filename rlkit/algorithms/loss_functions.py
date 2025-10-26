@@ -638,18 +638,15 @@ class KnowledgeDistillationLoss(LossFunction):
         student_log_probs = torch.nn.functional.log_softmax(next_token_logits / T, dim=-1)
         
         # Apply temperature scaling to teacher log probabilities
-        # We have teacher_logprobs = log(P), so:
-        # - Divide by T in log space: log(P) / T = log(P^(1/T))
-        # - Then renormalize since division changes the distribution
-        teacher_logprobs_scaled = teacher_logprobs / T
-        
-        # Renormalize after temperature scaling (log-space trick for stability)
-        # log(P_scaled) = log(P^(1/T)) - log(sum(P^(1/T)))
-        #               = log(P)/T - log_sum_exp(log(P)/T)
-        teacher_logprobs_scaled = teacher_logprobs_scaled - torch.logsumexp(
-            teacher_logprobs_scaled, dim=-1, keepdim=True
+        # We have teacher_logprobs = log(P), so to apply temperature:
+        # - Scale in log space: log(P) / T = log(P^(1/T))
+        # - Renormalize: log(P^(1/T) / Z) where Z is the partition function
+        # This is equivalent to: log(P^(1/T)) - log_sum_exp(log(P)/T)
+        teacher_logprobs_temp_scaled = teacher_logprobs / T
+        teacher_logprobs_normalized = teacher_logprobs_temp_scaled - torch.logsumexp(
+            teacher_logprobs_temp_scaled, dim=-1, keepdim=True
         )
-        teacher_probs = torch.exp(teacher_logprobs_scaled)
+        teacher_probs = torch.exp(teacher_logprobs_normalized)
         
         # Compute KL divergence: KL(P||Q) = sum(P * log(P/Q)) = sum(P * (log(P) - log(Q)))
         kl_div = torch.nn.functional.kl_div(
@@ -749,7 +746,7 @@ class CombinedKDLoss(LossFunction):
             raise ValueError(
                 "teacher_logprobs must be provided in data dict for CombinedKDLoss. "
                 "This indicates that teacher inference was not run before student training. "
-                "In KDTrainer, ensure _get_teacher_logits() is called and the result is "
+                "In KDTrainer, ensure _get_teacher_logprobs() is called and the result is "
                 "added to the data dict before calling student_policy.train()."
             )
         
