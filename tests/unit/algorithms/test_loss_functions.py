@@ -24,6 +24,10 @@ from rlkit.algorithms.utils import masked_mean
 from rlkit.distributed.batched_data_dict import BatchedDataDict
 
 
+# Test constants
+LARGE_LOGIT_SCALE = 100.0  # For testing numerical stability with extreme values
+
+
 def test_nll_loss():
     if not torch.cuda.is_available():
         pytest.skip("No GPU available")
@@ -1121,8 +1125,8 @@ def test_combined_kd_loss_numerical_stability():
     }
 
     # Test with very large logits (should not cause overflow)
-    student_logits = torch.randn(1, 3, vocab_size, device=device) * 100
-    teacher_logits_raw = torch.randn(1, 3, vocab_size, device=device) * 100
+    student_logits = torch.randn(1, 3, vocab_size, device=device) * LARGE_LOGIT_SCALE
+    teacher_logits_raw = torch.randn(1, 3, vocab_size, device=device) * LARGE_LOGIT_SCALE
     teacher_logprobs = torch.nn.functional.log_softmax(teacher_logits_raw, dim=-1)
     data["teacher_logprobs"] = teacher_logprobs
 

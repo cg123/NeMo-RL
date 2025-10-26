@@ -178,9 +178,7 @@ class KDTrainer:
         # Load checkpoint paths if resuming
         if last_checkpoint_path:
             student_weights_path = Path(last_checkpoint_path) / "student" / "weights"
-            student_optimizer_path = (
-                Path(last_checkpoint_path) / "student" / "optimizer"
-            )
+            student_optimizer_path = Path(last_checkpoint_path) / "student" / "optimizer"
         else:
             student_weights_path = None
             student_optimizer_path = None
@@ -262,10 +260,7 @@ class KDTrainer:
             return {k: [x[k] for x in batch] for k in batch[0]}
 
         # Calculate batch size from global batch size and micro batch size
-        train_batch_size = (
-            policy_config["train_global_batch_size"]
-            // policy_config["train_micro_batch_size"]
-        )
+        train_batch_size = policy_config["train_global_batch_size"] // policy_config["train_micro_batch_size"]
 
         train_dataloader = StatefulDataLoader(
             train_dataset,
@@ -277,41 +272,29 @@ class KDTrainer:
 
         # Restore dataloader state if resuming
         if last_checkpoint_path is not None:
-            dataloader_state_path = os.path.join(
-                last_checkpoint_path, "train_dataloader.pt"
-            )
+            dataloader_state_path = os.path.join(last_checkpoint_path, "train_dataloader.pt")
             if os.path.exists(dataloader_state_path):
                 dataloader_state_dict = torch.load(dataloader_state_path)
                 train_dataloader.load_state_dict(dataloader_state_dict)
 
-        logging.info(
-            f"  ✓ Training dataloader loaded with {len(train_dataset)} samples"
-        )
+        logging.info(f"  ✓ Training dataloader loaded with {len(train_dataset)} samples")
 
         # Setup validation dataloader if enabled
         val_dataloader = None
         if kd_config["val_period"] > 0 or kd_config["val_at_start"]:
-            assert val_dataset is not None, (
-                "Validation dataset required if validation enabled"
-            )
-            val_batch_size = (
-                kd_config["val_global_batch_size"] // kd_config["val_micro_batch_size"]
-            )
+            assert val_dataset is not None, "Validation dataset required if validation enabled"
+            val_batch_size = kd_config["val_global_batch_size"] // kd_config["val_micro_batch_size"]
             val_dataloader = StatefulDataLoader(
                 val_dataset,
                 batch_size=val_batch_size,
                 shuffle=False,
                 collate_fn=collate_fn,
             )
-            logging.info(
-                f"  ✓ Validation dataloader loaded with {len(val_dataset)} samples"
-            )
+            logging.info(f"  ✓ Validation dataloader loaded with {len(val_dataset)} samples")
 
         return train_dataloader, val_dataloader
 
-    def _validate_cluster_allocation(
-        self, cluster_config: ClusterConfig, teacher_cluster_config: dict
-    ) -> None:
+    def _validate_cluster_allocation(self, cluster_config: ClusterConfig, teacher_cluster_config: dict) -> None:
         """Validate that cluster resources are properly allocated.
 
         Ensures that teacher + student don't exceed total available resources.
@@ -324,10 +307,7 @@ class KDTrainer:
             ValueError: If resource allocation is invalid
         """
         total_gpus = cluster_config["num_nodes"] * cluster_config["gpus_per_node"]
-        teacher_gpus = (
-            teacher_cluster_config["num_nodes"]
-            * teacher_cluster_config["gpus_per_node"]
-        )
+        teacher_gpus = teacher_cluster_config["num_nodes"] * teacher_cluster_config["gpus_per_node"]
         student_gpus = total_gpus - teacher_gpus
 
         if teacher_gpus <= 0:
@@ -374,9 +354,7 @@ class KDTrainer:
             num_gpus_per_node=teacher_gpus_per_node,
             max_colocated_worker_groups=1,
         )
-        logging.info(
-            f"  ✓ Teacher cluster: {teacher_num_nodes} nodes × {teacher_gpus_per_node} GPUs"
-        )
+        logging.info(f"  ✓ Teacher cluster: {teacher_num_nodes} nodes × {teacher_gpus_per_node} GPUs")
 
         # Student cluster (remaining resources)
         total_nodes = cluster_config["num_nodes"]
@@ -418,9 +396,7 @@ class KDTrainer:
             )
 
         logging.info("  ✓ Cluster allocation validated:")
-        logging.info(
-            f"    - Total: {total_nodes} nodes × {total_gpus_per_node} GPUs = {total_gpus} GPUs"
-        )
+        logging.info(f"    - Total: {total_nodes} nodes × {total_gpus_per_node} GPUs = {total_gpus} GPUs")
         logging.info(
             f"    - Teacher: {teacher_num_nodes} nodes × {teacher_gpus_per_node} GPUs = {teacher_total_gpus} GPUs"
         )
@@ -435,9 +411,7 @@ class KDTrainer:
             num_gpus_per_node=student_gpus_per_node,
             max_colocated_worker_groups=1,
         )
-        logging.info(
-            f"  ✓ Student cluster: {student_num_nodes} nodes × {student_gpus_per_node} GPUs"
-        )
+        logging.info(f"  ✓ Student cluster: {student_num_nodes} nodes × {student_gpus_per_node} GPUs")
 
         return student_cluster, teacher_cluster
 
@@ -487,9 +461,7 @@ class KDTrainer:
             optimizer_path=optimizer_path,
             init_optimizer=True,  # Student is trainable
             init_reference_model=False,  # No reference model needed for KD
-            use_hf_checkpoint=self.master_config["checkpointing"].get(
-                "hf_checkpoint", False
-            ),
+            use_hf_checkpoint=self.master_config["checkpointing"].get("hf_checkpoint", False),
         )
 
     def _initialize_teacher_policy(
@@ -533,10 +505,21 @@ class KDTrainer:
             )
 
         # Build PolicyConfig for teacher
+        # Validate expert parallelism if configured
+        teacher_ep_size = teacher_config.get("expert_parallel_size", 1)
+        if teacher_ep_size > 1:
+            teacher_gpus = teacher_config["cluster"]["num_nodes"] * teacher_config["cluster"]["gpus_per_node"]
+            if teacher_gpus % teacher_ep_size != 0:
+                raise ValueError(
+                    f"Teacher expert_parallel_size ({teacher_ep_size}) must evenly divide "
+                    f"the number of GPUs allocated to the teacher ({teacher_gpus}).\n"
+                    f"Teacher cluster: {teacher_config['cluster']['num_nodes']} nodes × "
+                    f"{teacher_config['cluster']['gpus_per_node']} GPUs/node = {teacher_gpus} GPUs\n"
+                    f"Solution: Adjust teacher.expert_parallel_size or teacher.cluster allocation."
+                )
+
         # Use student's logprob batch size for consistency
-        student_logprob_batch_size = self.master_config["student_policy"][
-            "logprob_batch_size"
-        ]
+        student_logprob_batch_size = self.master_config["student_policy"]["logprob_batch_size"]
 
         teacher_policy_config: PolicyConfig = {
             "model_name": teacher_config["model_name"],
@@ -547,9 +530,7 @@ class KDTrainer:
             "dtensor_v2_cfg": {
                 "enabled": True,
                 "tensor_parallel_size": teacher_config.get("tensor_parallel_size", 1),
-                "pipeline_parallel_size": teacher_config.get(
-                    "pipeline_parallel_size", 1
-                ),
+                "pipeline_parallel_size": teacher_config.get("pipeline_parallel_size", 1),
                 "context_parallel_size": 1,
                 "expert_parallel_size": teacher_config.get("expert_parallel_size", 1),
                 "cpu_offload": False,
@@ -609,17 +590,12 @@ class KDTrainer:
         # so this check is somewhat redundant. However, it's here for future-proofing in case
         # we support different tokenizers for teacher/student.
         if vocab_size <= 0:
-            raise ValueError(
-                f"Invalid vocabulary size: {vocab_size}. "
-                f"Tokenizer may not be properly initialized."
-            )
+            raise ValueError(f"Invalid vocabulary size: {vocab_size}. " f"Tokenizer may not be properly initialized.")
 
         logging.info(f"  ✓ Vocabulary size: {vocab_size}")
 
         # Validate sequence lengths match
-        student_max_len = self.master_config["student_policy"][
-            "max_total_sequence_length"
-        ]
+        student_max_len = self.master_config["student_policy"]["max_total_sequence_length"]
         teacher_max_len = self.master_config["teacher"]["max_total_sequence_length"]
 
         if student_max_len != teacher_max_len:
@@ -664,9 +640,7 @@ class KDTrainer:
                 pad_value=self.tokenizer.pad_token_id,
             )
             train_data["input_lengths"][i] = torch.tensor(len(input_ids))
-            train_data["token_mask"][i] = _pad_tensor(
-                torch.tensor(token_mask), max_batch_len, "right", pad_value=0
-            )
+            train_data["token_mask"][i] = _pad_tensor(torch.tensor(token_mask), max_batch_len, "right", pad_value=0)
             train_data["sample_mask"][i] = torch.tensor(sample_mask)
 
         if truncated > 0:
@@ -702,9 +676,7 @@ class KDTrainer:
 
         return teacher_logprobs
 
-    async def validate(
-        self, step: int
-    ) -> Optional[tuple[KDValidationMetrics, KDTimingMetrics]]:
+    async def validate(self, step: int) -> Optional[tuple[KDValidationMetrics, KDTimingMetrics]]:
         """Run validation on the validation dataset.
 
         Args:
@@ -759,20 +731,14 @@ class KDTrainer:
                 else:
                     val_metrics["val_loss"] += float(val_results["loss"])
                     # Extract component losses if available
-                    if (
-                        "all_mb_metrics" in val_results
-                        and len(val_results["all_mb_metrics"]) > 0
-                    ):
+                    if "all_mb_metrics" in val_results and len(val_results["all_mb_metrics"]) > 0:
                         first_mb = val_results["all_mb_metrics"][0]
                         val_metrics["val_base_loss"] += first_mb.get("base_loss", 0.0)
                         val_metrics["val_kd_loss"] += first_mb.get("kd_loss", 0.0)
                     num_valid_batches += 1
 
                 # Limit validation batches if configured
-                if (
-                    kd_config["val_batches"] > 0
-                    and batch_idx >= kd_config["val_batches"] - 1
-                ):
+                if kd_config["val_batches"] > 0 and batch_idx >= kd_config["val_batches"] - 1:
                     break
 
             if num_valid_batches > 0:
@@ -841,9 +807,7 @@ class KDTrainer:
 
         # Training loop
         while current_epoch < max_num_epochs and total_steps < max_num_steps:
-            logging.info(
-                f"\n{'=' * 25} Epoch {current_epoch + 1}/{max_num_epochs} {'=' * 25}"
-            )
+            logging.info(f"\n{'=' * 25} Epoch {current_epoch + 1}/{max_num_epochs} {'=' * 25}")
 
             for raw_batch in self.train_dataloader:
                 logging.info(f"\n{'=' * 25} Step {total_steps + 1} {'=' * 25}")
@@ -866,9 +830,7 @@ class KDTrainer:
                     # 3. Train student
                     logging.debug("Training student policy...")
                     with timer.time("student_training"):
-                        train_results = await self.student_policy.train(
-                            train_data, self.loss_fn
-                        )
+                        train_results = await self.student_policy.train(train_data, self.loss_fn)
 
                     # 4. Validation
                     val_metrics, val_timings = None, None
@@ -876,23 +838,14 @@ class KDTrainer:
                         val_result = await self.validate(total_steps + 1)
                         if val_result:
                             val_metrics, val_timings = val_result
-                            self.logger.log_metrics(
-                                val_metrics, total_steps + 1, prefix="validation"
-                            )
-                            self.logger.log_metrics(
-                                val_timings, total_steps + 1, prefix="timing/validation"
-                            )
+                            self.logger.log_metrics(val_metrics, total_steps + 1, prefix="validation")
+                            self.logger.log_metrics(val_timings, total_steps + 1, prefix="timing/validation")
 
                     # 5. Checkpointing
-                    consumed_samples += self.master_config["student_policy"][
-                        "train_global_batch_size"
-                    ]
+                    consumed_samples += self.master_config["student_policy"]["train_global_batch_size"]
                     is_last_step = total_steps + 1 >= max_num_steps
                     should_save_by_step = (
-                        is_last_step
-                        or (total_steps + 1)
-                        % self.master_config["checkpointing"]["save_period"]
-                        == 0
+                        is_last_step or (total_steps + 1) % self.master_config["checkpointing"]["save_period"] == 0
                     )
                     should_save_by_timeout = timeout.check_save()
 
@@ -959,9 +912,7 @@ class KDTrainer:
 
         with timer.time("checkpointing"):
             logging.info(f"Saving checkpoint for step {total_steps}...")
-            checkpoint_path = self.checkpointer.init_tmp_checkpoint(
-                total_steps, self.kd_save_state, self.master_config
-            )
+            checkpoint_path = self.checkpointer.init_tmp_checkpoint(total_steps, self.kd_save_state, self.master_config)
 
             # Save student policy
             self.student_policy.save_checkpoint(
@@ -997,9 +948,7 @@ class KDTrainer:
         logging.info("\n  ⏱️  Timing:")
         logging.info(f"  • Total step time: {total_time:.2f}s")
 
-        for k, v in sorted(
-            timing_metrics.items(), key=lambda item: item[1], reverse=True
-        ):
+        for k, v in sorted(timing_metrics.items(), key=lambda item: item[1], reverse=True):
             if k != "total_step_time":
                 percent = (v / total_time * 100) if total_time > 0 else 0
                 logging.info(f"  • {k}: {v:.2f}s ({percent:.1f}%)")
@@ -1011,12 +960,12 @@ class KDTrainer:
         """Log training metrics."""
         # Extract metrics from training results
         metrics = {
-            "loss": train_results["loss"].item()
-            if torch.is_tensor(train_results["loss"])
-            else train_results["loss"],
-            "grad_norm": train_results["grad_norm"].item()
-            if torch.is_tensor(train_results["grad_norm"])
-            else train_results["grad_norm"],
+            "loss": train_results["loss"].item() if torch.is_tensor(train_results["loss"]) else train_results["loss"],
+            "grad_norm": (
+                train_results["grad_norm"].item()
+                if torch.is_tensor(train_results["grad_norm"])
+                else train_results["grad_norm"]
+            ),
         }
 
         # Add microbatch metrics
