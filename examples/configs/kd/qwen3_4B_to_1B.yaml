@@ -1,0 +1,137 @@
+# Knowledge Distillation: Qwen3-4B (teacher) -> Qwen3-1B (student)
+# Simple example for testing on small GPUs
+
+# Overall cluster resources
+cluster:
+  num_nodes: 2  # Total nodes available
+  gpus_per_node: 4  # 8 GPUs total
+
+# Student policy (trainable)
+student_policy:
+  model_name: "Qwen/Qwen2.5-1.5B"
+  tokenizer:
+    name: \${student_policy.model_name}
+  
+  train_global_batch_size: 64
+  train_micro_batch_size: 2
+  logprob_batch_size: 2
+  max_total_sequence_length: 2048
+  precision: "bfloat16"
+  
+  dtensor_v2_cfg:
+    enabled: true
+    cpu_offload: false
+    sequence_parallel: false
+    activation_checkpointing: false
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    pipeline_parallel_size: 1
+    expert_parallel_size: 1
+    custom_parallel_plan: null
+  
+  sequence_packing:
+    enabled: true
+    train_mb_tokens: \${mul:\${student_policy.max_total_sequence_length}, \${student_policy.train_micro_batch_size}}
+    logprob_mb_tokens: \${mul:\${student_policy.max_total_sequence_length}, \${student_policy.logprob_batch_size}}
+    algorithm: "modified_first_fit_decreasing"
+    sequence_length_round: 64
+  
+  make_sequence_length_divisible_by: \${student_policy.dtensor_v2_cfg.tensor_parallel_size}
+  max_grad_norm: 1.0
+  
+  optimizer:
+    name: "torch.optim.AdamW"
+    kwargs:
+      lr: 5.0e-6
+      weight_decay: 0.01
+      betas: [0.9, 0.999]
+      eps: 1e-8
+      foreach: false
+      fused: false
+  
+  scheduler:
+    - name: "torch.optim.lr_scheduler.LinearLR"
+      kwargs:
+        start_factor: 0.1
+        end_factor: 1.0
+        total_iters: 100
+    - name: "torch.optim.lr_scheduler.CosineAnnealingLR"
+      kwargs:
+        T_max: 10000
+        eta_min: 5.0e-7
+    - milestones: [100]
+
+# Teacher policy (frozen, inference-only)
+teacher:
+  model_name: "Qwen/Qwen2.5-4B"
+  checkpoint_path: null  # Load from HuggingFace
+  precision: "float16"  # Lower precision for memory efficiency
+  max_total_sequence_length: \${student_policy.max_total_sequence_length}
+  
+  # Dedicate 1 node (4 GPUs) to teacher
+  cluster:
+    num_nodes: 1
+    gpus_per_node: 4
+  
+  # Teacher parallelism (4B model can run on single GPU but we'll use TP=2 for example)
+  tensor_parallel_size: 2
+  pipeline_parallel_size: 1
+
+# KD algorithm config
+kd:
+  max_num_steps: 5000
+  max_num_epochs: 3
+  seed: 42
+  
+  # Distillation hyperparameters
+  kd_weight: 0.5  # 50% supervised loss, 50% KD loss
+  temperature: 2.0  # Standard KD temperature
+  
+  # Validation
+  val_period: 100  # Validate every 100 steps
+  val_at_start: true
+  val_batches: 10
+  val_global_batch_size: 32
+  val_micro_batch_size: 2
+
+# Data config
+data:
+  dataset_name: "HuggingFaceH4/ultrachat_200k"  # Example dataset
+  dataset_type: "chat"
+  on_disk: false
+  max_input_seq_length: \${student_policy.max_total_sequence_length}
+  shuffle: true
+
+# Checkpointing
+checkpointing:
+  enabled: true
+  hf_checkpoint: true
+  checkpoint_dir: "results/kd_qwen4B_to_1B"
+  metric_name: "val_loss"
+  higher_is_better: false
+  keep_top_k: 3
+  save_period: 500
+  checkpoint_must_save_by: null
+
+# Logging
+logger:
+  log_dir: "logs"
+  num_val_samples_to_print: 3
+  wandb_enabled: true
+  tensorboard_enabled: false
+  mlflow_enabled: false
+  monitor_gpus: true
+  
+  wandb:
+    project: "nemo-kd"
+    name: "qwen4B-to-1B-kd"
+  
+  tensorboard: {}
+  
+  mlflow:
+    experiment_name: "nemo-kd"
+    run_name: "qwen4B-to-1B-kd"
+  
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10
