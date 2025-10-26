@@ -592,6 +592,12 @@ class KnowledgeDistillationLoss(LossFunction):
     """
     
     def __init__(self, temperature: float = 1.0):
+        if temperature <= 0:
+            raise ValueError(
+                f"Temperature must be positive, got {temperature}. "
+                f"Temperature controls the softness of the probability distributions. "
+                f"Typical values are between 1.0 (no smoothing) and 10.0 (very soft)."
+            )
         self.temperature = temperature
         self.loss_type = LossType.TOKEN_LEVEL
     
@@ -703,6 +709,13 @@ class CombinedKDLoss(LossFunction):
         """
         self.base_loss = base_loss
         self.kd_loss = kd_loss
+        if not 0 <= alpha <= 1:
+            raise ValueError(
+                f"Alpha must be in [0, 1], got {alpha}. "
+                f"Alpha controls the weight of KD loss: "
+                f"total_loss = (1-alpha)*base_loss + alpha*kd_loss. "
+                f"Use alpha=0 for pure supervised learning, alpha=1 for pure distillation."
+            )
         self.alpha = alpha
         self.loss_type = base_loss.loss_type  # Inherit from base loss
     

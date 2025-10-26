@@ -421,15 +421,44 @@ class KDTrainer:
         return student_cluster, teacher_cluster
     
     def _initialize_student_policy(
-        self,
-        cluster: RayVirtualCluster,
-        policy_config: PolicyConfig,
-        tokenizer: AutoTokenizer,
-        weights_path: Optional[Path],
-        optimizer_path: Optional[Path],
-    ) -> Policy:
-        """Initialize trainable student policy."""
-        return Policy(
+    self,
+    cluster: RayVirtualCluster,
+    policy_config: PolicyConfig,
+    tokenizer: AutoTokenizer,
+    weights_path: Optional[Path],
+    optimizer_path: Optional[Path],
+) -> Policy:
+    """Initialize trainable student policy.
+    
+    NOTE: Vocab parallelism (tensor_parallel_size > 1) is currently not supported
+    for knowledge distillation. See validation below for details.
+    """
+    # Validate no vocab parallelism before initializing
+    student_tp_size = policy_config["dtensor_v2_cfg"].get("tensor_parallel_size", 1)
+    if student_tp_size > 1:
+        raise NotImplementedError(
+            f"Knowledge Distillation does not currently support student vocab parallelism. "
+            f"Student is configured with tensor_parallel_size={student_tp_size}, "
+            f"but KD requires computing KL divergence over the full vocabulary distribution.\n"
+            f"\n"
+            f"Current issue: KnowledgeDistillationLoss computes log_softmax on the student logits, "
+            f"which with TP only contains a vocab shard [batch, seq, vocab_size/tp_size]. "
+            f"This produces incorrect probability distributions and KL divergence values.\n"
+            f"\n"
+            f"Solutions:\n"
+            f"  1. Set student_policy.dtensor_v2_cfg.tensor_parallel_size=1 (recommended)\n"
+            f"  2. Use data parallelism instead (increase num_nodes)\n"
+            f"  3. Use pipeline parallelism if the student model is large\n"
+            f"\n"
+            f"Note: Student models for KD are typically small (1B-7B) and don't require TP. "
+            f"If you need TP for the student, consider if distillation is the right approach.\n"
+            f"\n"
+            f"Future work: Support for matched TP sharding between teacher and student is planned. "
+            f"This would allow computing KL divergence correctly across vocab shards using "
+            f"distributed partition function computation. Estimated effort: 3-5 days."
+        )
+    
+    return Policy(
             cluster=cluster,
             config=policy_config,
             tokenizer=tokenizer,
@@ -441,19 +470,46 @@ class KDTrainer:
         )
     
     def _initialize_teacher_policy(
-        self,
-        cluster: RayVirtualCluster,
-        teacher_config: TeacherConfig,
-        tokenizer: AutoTokenizer,
-    ) -> Policy:
-        """Initialize frozen teacher policy (inference only).
-        
-        Teacher policy:
-        - No optimizer (frozen weights)
-        - No reference model
-        - Set to eval mode (disables dropout)
-        """
-        # Build PolicyConfig for teacher
+    self,
+    cluster: RayVirtualCluster,
+    teacher_config: TeacherConfig,
+    tokenizer: AutoTokenizer,
+) -> Policy:
+    """Initialize frozen teacher policy (inference only).
+    
+    Teacher policy:
+    - No optimizer (frozen weights)
+    - No reference model
+    - Set to eval mode (disables dropout)
+    
+    NOTE: Vocab parallelism (tensor_parallel_size > 1) is currently not supported
+    for knowledge distillation. See validation below for details.
+    """
+    # Validate no vocab parallelism before initializing
+    teacher_tp_size = teacher_config.get("tensor_parallel_size", 1)
+    if teacher_tp_size > 1:
+        raise NotImplementedError(
+            f"Knowledge Distillation does not currently support teacher vocab parallelism. "
+            f"Teacher is configured with tensor_parallel_size={teacher_tp_size}, "
+            f"but KD requires the full vocabulary distribution from the teacher.\n"
+            f"\n"
+            f"Current issue: Policy.get_logprobs() returns per-token log probabilities "
+            f"with shape [batch, seq_len], not full distributions [batch, seq_len, vocab_size]. "
+            f"With TP, the full vocabulary distribution is never materialized - each rank only "
+            f"computes logprobs for tokens in its vocab shard. KD needs the complete distribution "
+            f"to compute KL divergence.\n"
+            f"\n"
+            f"Solutions:\n"
+            f"  1. Set teacher.tensor_parallel_size=1 (recommended)\n"
+            f"  2. Use pipeline parallelism for the teacher instead (if model is large)\n"
+            f"  3. Wait for full logprob gathering support (future work)\n"
+            f"\n"
+            f"Future work: Add Policy.get_full_logprobs() method that returns "
+            f"[batch, seq, vocab_size] tensors by gathering across TP ranks, or implement "
+            f"matched TP sharding approach. Estimated effort: 3-5 days."
+        )
+    
+    # Build PolicyConfig for teacher
         # Use student's logprob batch size for consistency
         student_logprob_batch_size = self.master_config["student_policy"]["logprob_batch_size"]
         
@@ -511,20 +567,32 @@ class KDTrainer:
         return teacher
     
     def _validate_tokenizers(self) -> None:
-        """Validate student and teacher use compatible tokenizers.
-        
-        Ensures:
-        - Same vocab size
-        - Same tokenization for test string
-        """
-        # Test tokenization consistency
-        test_text = "Hello, world! This is a test."
-        test_tokens = self.tokenizer(test_text, return_tensors="pt")
-        
-        # Get vocab size from tokenizer
-        vocab_size = len(self.tokenizer)
-        
-        # Validate sequence lengths match
+    """Validate student and teacher use compatible tokenizers.
+    
+    Ensures:
+    - Same vocab size
+    - Same tokenization for test string
+    """
+    # Test tokenization consistency
+    test_text = "Hello, world! This is a test."
+    test_tokens = self.tokenizer(test_text, return_tensors="pt")
+    
+    # Get vocab size from tokenizer
+    vocab_size = len(self.tokenizer)
+    
+    # Validate vocab size consistency
+    # Note: Both teacher and student use the same tokenizer object in current implementation,
+    # so this check is somewhat redundant. However, it's here for future-proofing in case
+    # we support different tokenizers for teacher/student.
+    if vocab_size <= 0:
+        raise ValueError(
+            f"Invalid vocabulary size: {vocab_size}. "
+            f"Tokenizer may not be properly initialized."
+        )
+    
+    logging.info(f"  ✓ Vocabulary size: {vocab_size}")
+    
+    # Validate sequence lengths match
         student_max_len = self.master_config["student_policy"]["max_total_sequence_length"]
         teacher_max_len = self.master_config["teacher"]["max_total_sequence_length"]
         
