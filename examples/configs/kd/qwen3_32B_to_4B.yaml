@@ -84,7 +84,7 @@ kd:
   seed: 42
   
   # Distillation hyperparameters
-  kd_weight: 0.7  # 30% supervised loss, 70% KD loss (emphasize teacher)
+  alpha: 0.7  # 30% supervised loss, 70% KD loss (emphasize teacher)
   temperature: 3.0  # Higher temperature for softer distributions
   
   # Validation

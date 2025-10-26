@@ -84,7 +84,7 @@ kd:
   seed: 42
   
   # Distillation hyperparameters
-  kd_weight: 0.5  # 50% supervised loss, 50% KD loss
+  alpha: 0.5  # 50% supervised loss, 50% KD loss
   temperature: 2.0  # Standard KD temperature
   
   # Validation

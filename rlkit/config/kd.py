@@ -41,12 +41,17 @@ class KDConfig(TypedDict):
     seed: int
     
     # Distillation hyperparameters
-    kd_weight: float  # β coefficient: total_loss = (1-β)*base_loss + β*kd_loss
-    temperature: float  # Temperature for softening logits (1.0 = no softening)
+    # alpha coefficient: total_loss = (1-alpha)*base_loss + alpha*kd_loss
+    # Range: [0.0, 1.0] where 0.0 = pure supervised, 1.0 = pure distillation
+    alpha: NotRequired[float]  # Default: 0.5
+    
+    # Temperature for softening logits (Hinton et al. 2015)
+    # Range: >= 1.0 where 1.0 = no softening, 2.0-4.0 = typical KD range
+    temperature: NotRequired[float]  # Default: 2.0
     
     # Validation
-    val_period: int  # Validate every N steps (0 = disabled)
-    val_at_start: bool
+    val_period: NotRequired[int]  # Default: 0 (disabled)
+    val_at_start: NotRequired[bool]  # Default: False
     val_batches: int  # Number of batches to use for validation (-1 = all)
     val_global_batch_size: int
     val_micro_batch_size: int

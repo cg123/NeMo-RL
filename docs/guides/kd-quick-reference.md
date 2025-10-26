@@ -14,7 +14,7 @@ uv run examples/run_kd.py --config examples/configs/kd/qwen3_32B_to_4B.yaml
 # With overrides
 uv run examples/run_kd.py \\
   --config examples/configs/kd/qwen3_4B_to_1B.yaml \\
-  kd.kd_weight=0.8 \\
+  kd.alpha=0.8 \\
   kd.temperature=3.0
 ```
 
@@ -41,7 +41,7 @@ teacher:
   tensor_parallel_size: 2
 
 kd:
-  kd_weight: 0.5
+  alpha: 0.5
   temperature: 2.0
   max_num_steps: 5000
   val_period: 100
@@ -70,7 +70,7 @@ kd:
 
 ```bash
 # Adjust KD weight
-kd.kd_weight=0.8
+kd.alpha=0.8
 
 # Adjust temperature
 kd.temperature=4.0

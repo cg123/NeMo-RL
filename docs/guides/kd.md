@@ -50,7 +50,7 @@ L_total = (1 - α) * L_supervised + α * L_KD
 Where:
 - **L_supervised**: Standard cross-entropy with ground truth labels
 - **L_KD**: KL divergence between student and teacher logits (softened by temperature)
-- **α** (kd_weight): Balances the two losses (0 = pure supervised, 1 = pure distillation)
+- **α** (alpha): Balances the two losses (0 = pure supervised, 1 = pure distillation)
 
 ### Temperature Scaling
 
@@ -160,7 +160,7 @@ kd:
   seed: 42
   
   # Distillation hyperparameters
-  kd_weight: 0.7        # α in loss formula
+  alpha: 0.7        # α in loss formula
   temperature: 3.0      # T for softening logits
   
   # Validation
@@ -172,7 +172,7 @@ kd:
 ```
 
 **Key parameters**:
-- `kd_weight`: How much to emphasize teacher (see [Understanding KD Hyperparameters](#understanding-kd-hyperparameters))
+- `alpha`: How much to emphasize teacher (see [Understanding KD Hyperparameters](#understanding-kd-hyperparameters))
 - `temperature`: How soft to make distributions
 
 ### 4. Cluster Allocation
@@ -203,7 +203,7 @@ See [Cluster Allocation](#cluster-allocation) for details.
 L_total = (1 - α) * L_supervised + α * L_KD
 ```
 
-**Choosing `kd_weight`**:
+**Choosing `alpha`**:
 
 | Scenario | Recommended α | Reasoning |
 |----------|--------------|----------|
@@ -354,7 +354,7 @@ uv run examples/run_kd.py --config examples/configs/kd/qwen3_4B_to_1B.yaml
 # Adjust KD hyperparameters
 uv run examples/run_kd.py \\
   --config examples/configs/kd/qwen3_4B_to_1B.yaml \\
-  kd.kd_weight=0.8 \\
+  kd.alpha=0.8 \\
   kd.temperature=3.5
 
 # Use custom dataset
@@ -404,7 +404,7 @@ NeMo RL KD logs comprehensive metrics to W&B, TensorBoard, or MLflow:
 - **`train/total_loss`**: Combined supervised + KD loss (what's being minimized)
 - **`train/base_loss`**: Supervised component (cross-entropy with labels)
 - **`train/kd_loss`**: Distillation component (KL divergence with teacher)
-- **`train/kd_weight`**: Current α value (for verification)
+- **`train/alpha`**: Current α value (for verification)
 - **`train/temperature`**: Current T value (for verification)
 - **`train/grad_norm`**: Gradient norm (for stability monitoring)
 
@@ -434,7 +434,7 @@ Your training is healthy if:
 
 🔴 **`kd_loss` not improving**:
 - Temperature too high/low → Adjust `kd.temperature`
-- Teacher not helpful → Reduce `kd.kd_weight`
+- Teacher not helpful → Reduce `kd.alpha`
 - Tokenizer mismatch → Check initialization logs
 
 🔴 **`val_loss` increasing**:
@@ -476,7 +476,7 @@ Training student policy...
 
 ```yaml
 kd:
-  kd_weight: 0.5      # Equal mix
+  alpha: 0.5      # Equal mix
   temperature: 2.0    # Standard
 ```
 
@@ -540,7 +540,7 @@ kd:
   val_at_start: true    # Establish baseline
 ```
 
-Compare `val_loss` with different `kd_weight` and `temperature` values.
+Compare `val_loss` with different `alpha` and `temperature` values.
 
 ## Troubleshooting
 
@@ -634,12 +634,12 @@ teacher:
 #### Validation Loss Worse Than Baseline
 
 **Possible causes**:
-1. **kd_weight too high**: Reduce α to preserve ground truth
+1. **alpha too high**: Reduce α to preserve ground truth
 2. **Teacher overfitting**: Teacher memorized training data
 3. **Different domains**: Teacher trained on different distribution
 
 **Solutions**:
-1. Reduce `kd.kd_weight` to 0.3-0.5
+1. Reduce `kd.alpha` to 0.3-0.5
 2. Increase regularization (dropout, weight decay)
 3. Use domain-specific teacher or reduce α
 
@@ -665,13 +665,13 @@ Start with high α, gradually reduce:
 
 ```python
 # In scheduler config (future feature)
-kd_weight_schedule:
+alpha_schedule:
   start: 0.9
   end: 0.5
   steps: 10000
 ```
 
-*Note: Currently use fixed `kd_weight`. Scheduling is a future enhancement.*
+*Note: Currently use fixed `alpha`. Scheduling is a future enhancement.*
 
 ### Different Teacher/Student Architectures
 

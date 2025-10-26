@@ -171,11 +171,18 @@ class KDTrainer:
         # Setup loss function
         logging.info("Setting up loss function...")
         base_loss = NLLLoss()
+        
+        # Get KD hyperparameters with defaults
+        alpha = kd_config.get("alpha", 0.5)
+        temperature = kd_config.get("temperature", 2.0)
+        
         self.loss_fn = CombinedKDLoss(
             base_loss=base_loss,
-            kd_weight=kd_config["kd_weight"],
-            temperature=kd_config["temperature"],
+            alpha=alpha,
+            temperature=temperature,
         )
+        
+        logging.info(f"  ✓ KD loss: alpha={alpha}, temperature={temperature}")
         
         logging.info("  ✓ KD Trainer initialized successfully")
     
@@ -280,20 +287,51 @@ class KDTrainer:
         total_gpus_per_node = cluster_config["gpus_per_node"]
         
         # Validate cluster allocation
+        # Calculate total GPUs
+        total_gpus = total_nodes * total_gpus_per_node
+        teacher_total_gpus = teacher_num_nodes * teacher_gpus_per_node
+        
+        # Check if teacher allocation is valid
         if teacher_num_nodes > total_nodes:
             raise ValueError(
-                f"Teacher requires {teacher_num_nodes} nodes but only "
-                f"{total_nodes} total nodes available"
+                f"Invalid cluster allocation: Teacher requires {teacher_num_nodes} nodes, "
+                f"but only {total_nodes} total nodes available.\n"
+                f"  Teacher GPUs: {teacher_num_nodes} nodes × {teacher_gpus_per_node} GPUs/node = {teacher_total_gpus} GPUs\n"
+                f"  Total GPUs: {total_nodes} nodes × {total_gpus_per_node} GPUs/node = {total_gpus} GPUs\n"
+                f"Solution: Reduce teacher.cluster.num_nodes or increase cluster.num_nodes"
+            )
+        
+        if teacher_gpus_per_node != total_gpus_per_node:
+            raise ValueError(
+                f"Invalid cluster allocation: teacher.cluster.gpus_per_node ({teacher_gpus_per_node}) "
+                f"must equal cluster.gpus_per_node ({total_gpus_per_node}).\n"
+                f"NeMo RL requires uniform GPUs per node across the cluster."
             )
         
         student_num_nodes = total_nodes - teacher_num_nodes
         student_gpus_per_node = total_gpus_per_node
+        student_total_gpus = student_num_nodes * student_gpus_per_node
         
         if student_num_nodes == 0:
             raise ValueError(
-                "No nodes remaining for student training after teacher allocation. "
-                "Increase cluster.num_nodes or reduce teacher.cluster.num_nodes."
+                f"Invalid cluster allocation: No nodes remaining for student training.\n"
+                f"  Total nodes: {total_nodes}\n"
+                f"  Teacher nodes: {teacher_num_nodes}\n"
+                f"  Student nodes: {student_num_nodes} (= total - teacher)\n"
+                f"Solution: Increase cluster.num_nodes or reduce teacher.cluster.num_nodes"
             )
+        
+        logging.info(
+            f"  ✓ Cluster allocation validated:")
+        logging.info(
+            f"    - Total: {total_nodes} nodes × {total_gpus_per_node} GPUs = {total_gpus} GPUs"
+        )
+        logging.info(
+            f"    - Teacher: {teacher_num_nodes} nodes × {teacher_gpus_per_node} GPUs = {teacher_total_gpus} GPUs"
+        )
+        logging.info(
+            f"    - Student: {student_num_nodes} nodes × {student_gpus_per_node} GPUs = {student_total_gpus} GPUs"
+        )
         
         student_cluster = RayVirtualCluster(
             name="kd_student_cluster",
@@ -598,8 +636,8 @@ class KDTrainer:
         kd_config = self.master_config["kd"]
         max_num_epochs = kd_config["max_num_epochs"]
         max_num_steps = kd_config["max_num_steps"]
-        val_period = kd_config["val_period"]
-        val_at_start = kd_config["val_at_start"]
+        val_period = kd_config.get("val_period", 0)
+        val_at_start = kd_config.get("val_at_start", False)
         
         # Initial validation
         if val_at_start and total_steps == 0:
@@ -770,7 +808,7 @@ class KDTrainer:
             mb_metrics = train_results["all_mb_metrics"]
             if len(mb_metrics) > 0:
                 # Aggregate metrics across microbatches
-                for key in ["base_loss", "kd_loss", "total_loss", "kd_weight", "temperature"]:
+                for key in ["base_loss", "kd_loss", "total_loss", "alpha", "temperature"]:
                     values = [mb.get(key, 0.0) for mb in mb_metrics if key in mb]
                     if values:
                         metrics[key] = np.mean(values).item()
@@ -785,8 +823,8 @@ class KDTrainer:
             logging.info(f"  • Base Loss: {metrics['base_loss']:.4f}")
         if "kd_loss" in metrics:
             logging.info(f"  • KD Loss: {metrics['kd_loss']:.4f}")
-        if "kd_weight" in metrics:
-            logging.info(f"  • KD Weight: {metrics['kd_weight']:.3f}")
+        if "alpha" in metrics:
+            logging.info(f"  • Alpha (distillation weight): {metrics['alpha']:.3f}")
         if "temperature" in metrics:
             logging.info(f"  • Temperature: {metrics['temperature']:.2f}")
         logging.info(f"  • Grad Norm: {metrics['grad_norm']:.4f}")

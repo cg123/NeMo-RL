@@ -77,7 +77,7 @@ class KDConfig(TypedDict):
     max_num_epochs: int
     seed: int
     
-    kd_weight: float      # α ∈ [0, 1]
+    alpha: float      # α ∈ [0, 1]
     temperature: float    # T ≥ 1.0
     
     val_period: int
@@ -141,7 +141,7 @@ class CombinedKDLoss(LossFunction):
         kd_loss, kd_metrics = self.kd_loss(student_logits, data, ...)
         
         # Weighted combination
-        total_loss = (1 - self.kd_weight) * base_loss + self.kd_weight * kd_loss
+        total_loss = (1 - self.alpha) * base_loss + self.alpha * kd_loss
         
         return total_loss, {**base_metrics, **kd_metrics, "total_loss": ...}
 ```
@@ -550,7 +550,7 @@ Use these to tune hyperparameters:
     "train/loss": 2.1234,           # Total loss
     "train/base_loss": 2.3456,      # Supervised loss
     "train/kd_loss": 1.8901,        # KD loss
-    "train/kd_weight": 0.7,         # α coefficient
+    "train/alpha": 0.7,         # α coefficient
     "train/temperature": 3.0,       # T value
     "train/grad_norm": 0.8765,      # Gradient norm
 }
@@ -610,7 +610,7 @@ Training student policy...
 
 2. **KD weight scheduling**: Gradually shift from teacher to labels
    ```python
-   kd_weight_schedule:
+   alpha_schedule:
      start: 0.9  # Emphasize teacher early
      end: 0.5    # Balance later
      steps: 10000
@@ -646,7 +646,7 @@ class CustomKDLoss(LossFunction):
 self.loss_fn = CombinedKDLoss(
     base_loss=NLLLoss(),
     kd_loss=CustomKDLoss(),  # Instead of KnowledgeDistillationLoss
-    kd_weight=0.5,
+    alpha=0.5,
 )
 ```
 

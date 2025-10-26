@@ -52,7 +52,7 @@ uv run examples/run_kd.py --config examples/configs/kd/qwen3_32B_to_4B.yaml
 # Change KD weight
 uv run examples/run_kd.py \\
   --config examples/configs/kd/qwen3_4B_to_1B.yaml \\
-  kd.kd_weight=0.8
+  kd.alpha=0.8
 
 # Change temperature
 uv run examples/run_kd.py \\
@@ -75,7 +75,7 @@ uv run examples/run_kd.py \\
 
 ### Distillation Hyperparameters
 
-- **`kd.kd_weight`** (0.0 - 1.0): Weight for distillation loss
+- **`kd.alpha`** (0.0 - 1.0): Weight for distillation loss
   - 0.0 = pure supervised learning (ignore teacher)
   - 0.5 = equal mix of supervised + distillation
   - 1.0 = pure distillation (ignore labels)
@@ -189,7 +189,7 @@ ValueError: teacher_logits must be provided
 
 **KD loss not improving**:
 - Temperature too high/low → Adjust `kd.temperature`
-- Teacher not helpful → Reduce `kd.kd_weight`
+- Teacher not helpful → Reduce `kd.alpha`
 - Tokenizer mismatch → Check `_validate_tokenizers` logs
 
 **Training too slow**:

@@ -617,6 +617,10 @@ class KnowledgeDistillationLoss(LossFunction):
             tuple of (loss, metrics_dict)
         """
         # Cast to float32 for numerical stability
+        # Note: While PyTorch's F.kl_div handles mixed precision inputs,
+        # we explicitly cast to float32 here to ensure consistent numerical
+        # behavior across different hardware and to avoid potential precision
+        # issues when computing log probabilities (log of small numbers).
         next_token_logits = next_token_logits.float()
         
         # Get teacher logits from data dict
@@ -666,7 +670,7 @@ class CombinedKDLoss(LossFunction):
     
     total_loss = (1 - α) * base_loss + α * kd_loss
     
-    where α is the kd_weight parameter.
+    where α is the alpha parameter.
     
     This allows training with both ground truth labels (base_loss) and
     teacher model outputs (kd_loss) simultaneously.
@@ -675,20 +679,20 @@ class CombinedKDLoss(LossFunction):
     def __init__(
         self, 
         base_loss: LossFunction,
-        kd_weight: float,
+        alpha: float,
         temperature: float = 1.0,
     ):
         """Initialize combined loss.
         
         Args:
             base_loss: Base supervised loss (e.g., NLLLoss)
-            kd_weight: Weight for KD loss (α). Range [0, 1].
+            alpha: Weight for KD loss (α). Range [0, 1].
                       0 = pure supervised, 1 = pure distillation
             temperature: Temperature for KD loss
         """
         self.base_loss = base_loss
         self.kd_loss = KnowledgeDistillationLoss(temperature)
-        self.kd_weight = kd_weight
+        self.alpha = alpha
         self.loss_type = base_loss.loss_type  # Inherit from base loss
     
     def __call__(
@@ -730,7 +734,9 @@ class CombinedKDLoss(LossFunction):
         if "teacher_logits" not in data or data["teacher_logits"] is None:
             raise ValueError(
                 "teacher_logits must be provided in data dict for CombinedKDLoss. "
-                "Ensure teacher inference is run before student training."
+                "This indicates that teacher inference was not run before student training. "
+                "In KDTrainer, ensure _get_teacher_logits() is called and the result is "
+                "added to the data dict before calling student_policy.train()."
             )
         
         kd_loss_val, kd_metrics = self.kd_loss(
@@ -744,13 +750,13 @@ class CombinedKDLoss(LossFunction):
         )
         
         # Combine losses: (1-α)*base + α*kd
-        total_loss = (1 - self.kd_weight) * base_loss_val + self.kd_weight * kd_loss_val
+        total_loss = (1 - self.alpha) * base_loss_val + self.alpha * kd_loss_val
         
         metrics = {
             **base_metrics,
             **kd_metrics,
             "base_loss": base_loss_val.item(),
-            "kd_weight": self.kd_weight,
+            "alpha": self.alpha,
             "total_loss": total_loss.item(),
         }
         
