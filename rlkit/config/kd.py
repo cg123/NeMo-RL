@@ -7,6 +7,13 @@ from rlkit.config.cluster import ClusterConfig
 from rlkit.config.checkpointing import CheckpointingConfig
 
 
+# Default values for optional KD parameters
+KD_DEFAULT_ALPHA = 0.5
+KD_DEFAULT_TEMPERATURE = 2.0
+KD_DEFAULT_VAL_PERIOD = 0
+KD_DEFAULT_VAL_AT_START = False
+
+
 class KDLoggerConfig(LoggerConfig):
     """Logger configuration for knowledge distillation."""
     num_val_samples_to_print: int

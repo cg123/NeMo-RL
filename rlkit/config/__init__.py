@@ -16,7 +16,17 @@ from .rl.policy import RewardModelConfig
 from .rl.policy.dtv2 import DTensorV2Config
 from .sft import SFTConfig, SFTMasterConfig
 from .rm import RMConfig, RMMasterConfig
-from .kd import KDConfig, KDLoggerConfig, KDMasterConfig, TeacherConfig, TeacherClusterConfig
+from .kd import (
+    KDConfig,
+    KDLoggerConfig,
+    KDMasterConfig,
+    TeacherConfig,
+    TeacherClusterConfig,
+    KD_DEFAULT_ALPHA,
+    KD_DEFAULT_TEMPERATURE,
+    KD_DEFAULT_VAL_PERIOD,
+    KD_DEFAULT_VAL_AT_START,
+)
 
 __all__ = [
     "RLConfig",
@@ -47,4 +57,8 @@ __all__ = [
     "KDMasterConfig",
     "TeacherConfig",
     "TeacherClusterConfig",
+    "KD_DEFAULT_ALPHA",
+    "KD_DEFAULT_TEMPERATURE",
+    "KD_DEFAULT_VAL_PERIOD",
+    "KD_DEFAULT_VAL_AT_START",
 ]

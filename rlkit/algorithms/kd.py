@@ -36,6 +36,10 @@ from rlkit.config import (
     CheckpointingConfig,
     ClusterConfig,
     DataConfig,
+    KD_DEFAULT_ALPHA,
+    KD_DEFAULT_TEMPERATURE,
+    KD_DEFAULT_VAL_PERIOD,
+    KD_DEFAULT_VAL_AT_START,
 )
 from rlkit.distributed.batched_data_dict import BatchedDataDict
 from rlkit.distributed.virtual_cluster import RayVirtualCluster
@@ -46,6 +50,22 @@ from rlkit.utils.timer import TimeoutChecker, Timer
 from rlkit.utils.nsys import maybe_gpu_profile_step
 
 import ray
+
+
+class KDValidationMetrics(TypedDict):
+    """Validation metrics for knowledge distillation."""
+    val_loss: float
+    val_base_loss: float
+    val_kd_loss: float
+
+
+class KDTimingMetrics(TypedDict, total=False):
+    """Timing metrics for KD training."""
+    total_validation_time: float
+    total_step_time: float
+    data_processing: float
+    teacher_inference: float
+    student_training: float
 
 
 class KDSaveState(TypedDict):
@@ -173,8 +193,8 @@ class KDTrainer:
         base_loss = NLLLoss()
         
         # Get KD hyperparameters with defaults
-        alpha = kd_config.get("alpha", 0.5)
-        temperature = kd_config.get("temperature", 2.0)
+        alpha = kd_config.get("alpha", KD_DEFAULT_ALPHA)
+        temperature = kd_config.get("temperature", KD_DEFAULT_TEMPERATURE)
         
         self.loss_fn = CombinedKDLoss(
             base_loss=base_loss,
@@ -527,14 +547,14 @@ class KDTrainer:
     
     async def validate(
         self, step: int
-    ) -> Optional[tuple[dict[str, float], dict[str, float]]]:
+    ) -> Optional[tuple[KDValidationMetrics, KDTimingMetrics]]:
         """Run validation on the validation dataset.
         
         Args:
             step: Current training step
             
         Returns:
-            Optional tuple of (val_metrics, timing_metrics)
+            Optional tuple of (validation_metrics, timing_metrics)
         """
         if self.val_dataloader is None:
             logging.info("No validation dataloader provided, skipping validation")
@@ -596,6 +616,10 @@ class KDTrainer:
                 val_metrics["val_base_loss"] /= num_valid_batches
                 val_metrics["val_kd_loss"] /= num_valid_batches
             else:
+                # Set metrics to NaN when no valid batches to avoid confusion
+                val_metrics["val_loss"] = float('nan')
+                val_metrics["val_base_loss"] = float('nan')
+                val_metrics["val_kd_loss"] = float('nan')
                 warnings.warn(
                     "No validation metrics were collected. "
                     "This is likely because there were no valid samples in the validation set."
@@ -636,8 +660,8 @@ class KDTrainer:
         kd_config = self.master_config["kd"]
         max_num_epochs = kd_config["max_num_epochs"]
         max_num_steps = kd_config["max_num_steps"]
-        val_period = kd_config.get("val_period", 0)
-        val_at_start = kd_config.get("val_at_start", False)
+        val_period = kd_config.get("val_period", KD_DEFAULT_VAL_PERIOD)
+        val_at_start = kd_config.get("val_at_start", KD_DEFAULT_VAL_AT_START)
         
         # Initial validation
         if val_at_start and total_steps == 0:

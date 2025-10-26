@@ -26,7 +26,11 @@ from omegaconf import OmegaConf
 import torch
 from transformers import AutoTokenizer
 
-from rlkit.config import KDMasterConfig as MasterConfig
+from rlkit.config import (
+    KDMasterConfig as MasterConfig,
+    KD_DEFAULT_ALPHA,
+    KD_DEFAULT_TEMPERATURE,
+)
 from rlkit.algorithms.kd import KDTrainer
 from rlkit.data.datasets import transform_dataset
 from rlkit.algorithms.utils import get_tokenizer
@@ -138,12 +142,22 @@ def main():
     # Setup tokenizer (same for both student and teacher)
     tokenizer = get_tokenizer(config["student_policy"]["tokenizer"])
 
-    # Verify teacher uses compatible tokenizer
     teacher_model_name = config["teacher"]["model_name"]
+    
+    # Verify teacher uses compatible tokenizer
+    teacher_tokenizer = AutoTokenizer.from_pretrained(teacher_model_name)
+    if tokenizer.vocab_size != teacher_tokenizer.vocab_size:
+        raise ValueError(
+            f"Teacher and student tokenizers have different vocab sizes: "
+            f"student={tokenizer.vocab_size}, teacher={teacher_tokenizer.vocab_size}. "
+            f"Knowledge distillation requires compatible tokenizers with matching vocabularies."
+        )
+    logging.info(f"✓ Verified teacher tokenizer compatibility (vocab_size={tokenizer.vocab_size})")
+    
     print(f"\n🔍 Student model: {config['student_policy']['model_name']}")
     print(f"🔍 Teacher model: {teacher_model_name}")
-    print(f"🔍 KD weight: {config['kd']['kd_weight']}")
-    print(f"🔍 Temperature: {config['kd']['temperature']}")
+    print(f"🔍 KD alpha (distillation weight): {config['kd'].get('alpha', KD_DEFAULT_ALPHA)}")
+    print(f"🔍 Temperature: {config['kd'].get('temperature', KD_DEFAULT_TEMPERATURE)}")
 
     # Setup data
     train_dataset, val_dataset = setup_data(tokenizer, config["data"])
@@ -151,14 +165,15 @@ def main():
     # Initialize KD trainer
     trainer = KDTrainer(config, tokenizer, train_dataset, val_dataset)
     
-    # Run training
-    asyncio.run(trainer.train())
-    
-    # Cleanup
-    trainer.student_policy.shutdown()
-    trainer.teacher_policy.shutdown()
-    
-    print("\n✅ KD training completed successfully!")
+    # Run training with proper cleanup
+    try:
+        asyncio.run(trainer.train())
+        print("\n✅ KD training completed successfully!")
+    finally:
+        # Ensure cleanup happens even if training fails
+        print("\nCleaning up...")
+        trainer.student_policy.shutdown()
+        trainer.teacher_policy.shutdown()
 
 
 if __name__ == "__main__":
