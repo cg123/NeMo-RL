@@ -1,17 +1,17 @@
-# Knowledge Distillation: Qwen3-4B (teacher) -> Qwen3-1B (student)
-# Example: 4B teacher → 1.5B student (2 nodes, 8 GPUs total)
-# Note: TP > 1 not currently supported, models must fit on single GPU
+# Knowledge Distillation: Qwen2.5-MoE (teacher) → Qwen3-1.5B (student)
+# Example for MoE teacher with expert parallelism
+# Note: TP > 1 not currently supported, but EP works for MoE models
 
 # Overall cluster resources
 cluster:
   num_nodes: 2  # Total nodes available
-  gpus_per_node: 4  # 8 GPUs total
+  gpus_per_node: 8  # 16 GPUs total
 
 # Student policy (trainable)
 student_policy:
   model_name: "Qwen/Qwen2.5-1.5B"
   tokenizer:
-    name: ${student_policy.model_name}
+    name: \${student_policy.model_name}
   
   train_global_batch_size: 64
   train_micro_batch_size: 2
@@ -24,20 +24,20 @@ student_policy:
     cpu_offload: false
     sequence_parallel: false
     activation_checkpointing: false
-    tensor_parallel_size: 1
+    tensor_parallel_size: 1  # TP > 1 not currently supported for KD
     context_parallel_size: 1
     pipeline_parallel_size: 1
-    expert_parallel_size: 1
+    expert_parallel_size: 1  # Student is not MoE
     custom_parallel_plan: null
   
   sequence_packing:
     enabled: true
-    train_mb_tokens: ${mul:${student_policy.max_total_sequence_length}, ${student_policy.train_micro_batch_size}}
-    logprob_mb_tokens: ${mul:${student_policy.max_total_sequence_length}, ${student_policy.logprob_batch_size}}
+    train_mb_tokens: \${mul:\${student_policy.max_total_sequence_length}, \${student_policy.train_micro_batch_size}}
+    logprob_mb_tokens: \${mul:\${student_policy.max_total_sequence_length}, \${student_policy.logprob_batch_size}}
     algorithm: "modified_first_fit_decreasing"
     sequence_length_round: 64
   
-  make_sequence_length_divisible_by: ${student_policy.dtensor_v2_cfg.tensor_parallel_size}
+  make_sequence_length_divisible_by: \${student_policy.dtensor_v2_cfg.tensor_parallel_size}
   max_grad_norm: 1.0
   
   optimizer:
@@ -62,21 +62,22 @@ student_policy:
         eta_min: 5.0e-7
     - milestones: [100]
 
-# Teacher policy (frozen, inference-only)
+# Teacher policy (frozen, inference-only, MoE model)
 teacher:
-  model_name: "Qwen/Qwen2.5-4B"
+  model_name: "Qwen/Qwen2.5-14B-Instruct"  # Replace with actual MoE model
   checkpoint_path: null  # Load from HuggingFace
   precision: "float16"  # Lower precision for memory efficiency
-  max_total_sequence_length: ${student_policy.max_total_sequence_length}
+  max_total_sequence_length: \${student_policy.max_total_sequence_length}
   
-  # Dedicate 1 node (4 GPUs) to teacher
+  # Dedicate 1 node (8 GPUs) to teacher
   cluster:
     num_nodes: 1
-    gpus_per_node: 4
+    gpus_per_node: 8
   
-  # Teacher parallelism (4B model can run on single GPU but we'll use TP=2 for example)
+  # Teacher parallelism - use expert parallelism for MoE
   tensor_parallel_size: 1  # TP > 1 not currently supported for KD
   pipeline_parallel_size: 1
+  expert_parallel_size: 4  # Distribute experts across 4 GPUs
 
 # KD algorithm config
 kd:
@@ -85,8 +86,8 @@ kd:
   seed: 42
   
   # Distillation hyperparameters
-  alpha: 0.5  # 50% supervised loss, 50% KD loss
-  temperature: 2.0  # Standard KD temperature
+  alpha: 0.6  # 40% supervised loss, 60% KD loss
+  temperature: 2.5  # Moderate temperature for MoE → dense distillation
   
   # Validation
   val_period: 100  # Validate every 100 steps
@@ -100,14 +101,14 @@ data:
   dataset_name: "HuggingFaceH4/ultrachat_200k"  # Example dataset
   dataset_type: "chat"
   on_disk: false
-  max_input_seq_length: ${student_policy.max_total_sequence_length}
+  max_input_seq_length: \${student_policy.max_total_sequence_length}
   shuffle: true
 
 # Checkpointing
 checkpointing:
   enabled: true
   hf_checkpoint: true
-  checkpoint_dir: "results/kd_qwen4B_to_1B"
+  checkpoint_dir: "results/kd_qwen_moe_to_1.5B"
   metric_name: "val_loss"
   higher_is_better: false
   keep_top_k: 3
@@ -125,13 +126,13 @@ logger:
   
   wandb:
     project: "nemo-kd"
-    name: "qwen4B-to-1B-kd"
+    name: "qwen-moe-to-1.5B-kd"
   
   tensorboard: {}
   
   mlflow:
     experiment_name: "nemo-kd"
-    run_name: "qwen4B-to-1B-kd"
+    run_name: "qwen-moe-to-1.5B-kd"
   
   gpu_monitoring:
     collection_interval: 10

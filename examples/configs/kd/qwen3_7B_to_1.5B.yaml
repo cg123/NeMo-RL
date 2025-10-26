@@ -1,14 +1,16 @@
 # Knowledge Distillation: Qwen3-32B (teacher) -> Qwen3-4B (student)
-# Production example for multi-node clusters
+# Knowledge Distillation: Qwen3-7B (teacher) → Qwen3-1.5B (student)
+# Multi-node example (3 nodes, 24 GPUs total)
+# Note: TP > 1 not currently supported, models must fit on single GPU
 
 # Overall cluster resources
 cluster:
-  num_nodes: 5  # Total nodes available
-  gpus_per_node: 8
+  num_nodes: 3  # Total nodes available
+  gpus_per_node: 8  # 24 GPUs total
 
 # Student policy (trainable)
 student_policy:
-  model_name: "Qwen/Qwen2.5-4B"
+  model_name: "Qwen/Qwen2.5-1.5B"
   tokenizer:
     name: ${student_policy.model_name}
   
@@ -22,8 +24,8 @@ student_policy:
     enabled: true
     cpu_offload: false
     sequence_parallel: false
-    activation_checkpointing: true
-    tensor_parallel_size: 2  # Student uses TP=2
+    activation_checkpointing: false
+    tensor_parallel_size: 1  # TP > 1 not currently supported for KD
     context_parallel_size: 1
     pipeline_parallel_size: 1
     expert_parallel_size: 1
@@ -63,7 +65,7 @@ student_policy:
 
 # Teacher policy (frozen, inference-only)
 teacher:
-  model_name: "Qwen/Qwen2.5-32B"
+  model_name: "Qwen/Qwen2.5-7B"
   checkpoint_path: null  # Load from HuggingFace
   precision: "float16"  # Lower precision for memory efficiency
   max_total_sequence_length: ${student_policy.max_total_sequence_length}
@@ -73,8 +75,8 @@ teacher:
     num_nodes: 1
     gpus_per_node: 8
   
-  # Teacher parallelism (32B model needs TP=8)
-  tensor_parallel_size: 8
+  # Teacher parallelism
+  tensor_parallel_size: 1  # TP > 1 not currently supported for KD
   pipeline_parallel_size: 1
 
 # KD algorithm config
@@ -84,9 +86,9 @@ kd:
   seed: 42
   
   # Distillation hyperparameters
-  alpha: 0.7  # 30% supervised loss, 70% KD loss (emphasize teacher)
-  temperature: 3.0  # Higher temperature for softer distributions
-  
+  alpha: 0.6  # 40% supervised loss, 60% KD loss
+  temperature: 2.5  # Moderate temperature for medium model gap
+
   # Validation
   val_period: 500  # Validate every 500 steps
   val_at_start: true
@@ -106,7 +108,7 @@ data:
 checkpointing:
   enabled: true
   hf_checkpoint: true
-  checkpoint_dir: "results/kd_qwen32B_to_4B"
+  checkpoint_dir: "results/kd_qwen7B_to_1.5B"
   metric_name: "val_loss"
   higher_is_better: false
   keep_top_k: 5
@@ -123,14 +125,14 @@ logger:
   monitor_gpus: true
   
   wandb:
-    project: "nemo-kd-production"
-    name: "qwen32B-to-4B-kd"
+    project: "nemo-kd"
+    name: "qwen7B-to-1.5B-kd"
   
   tensorboard: {}
   
   mlflow:
-    experiment_name: "nemo-kd-production"
-    run_name: "qwen32B-to-4B-kd"
+    experiment_name: "nemo-kd"
+    run_name: "qwen7B-to-1.5B-kd"
   
   gpu_monitoring:
     collection_interval: 10

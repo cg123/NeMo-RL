@@ -2,14 +2,18 @@
 
 A cheat sheet for common KD operations in NeMo RL.
 
+## ⚠️ Current Limitations
+
+**Tensor Parallelism Not Supported**: Both teacher and student must use `tensor_parallel_size: 1`. Models must fit on single GPU (~7B-14B with fp16/bf16).
+
 ## Launch Commands
 
 ```bash
 # Small example (2 nodes)
 uv run examples/run_kd.py --config examples/configs/kd/qwen3_4B_to_1B.yaml
 
-# Production (5 nodes)
-uv run examples/run_kd.py --config examples/configs/kd/qwen3_32B_to_4B.yaml
+# Multi-node example (3 nodes)
+uv run examples/run_kd.py --config examples/configs/kd/qwen3_7B_to_1.5B.yaml
 
 # With overrides
 uv run examples/run_kd.py \\
@@ -36,9 +40,9 @@ teacher:
   precision: "float16"
   max_total_sequence_length: \${student_policy.max_total_sequence_length}
   cluster:
-    num_nodes: 1
+  num_nodes: 1
     gpus_per_node: 4
-  tensor_parallel_size: 2
+  tensor_parallel_size: 1  # TP > 1 not currently supported
 
 kd:
   alpha: 0.5
@@ -62,9 +66,9 @@ kd:
 
 | Model Gap | Value | Example |
 |-----------|-------|--------|
-| Large | 3.0-5.0 | 32B → 1B |
-| Medium | 2.0-3.0 | 7B → 3B |
-| Small | 1.5-2.0 | 4B → 3B |
+| Large | 3.0-5.0 | 7B → 1B |
+| Medium | 2.0-3.0 | 4B → 1.5B |
+| Small | 1.5-2.0 | 3B → 2B |
 
 ## Common Overrides
 
@@ -127,7 +131,7 @@ ValueError: teacher_logprobs must be provided
 ```
 CUDA out of memory (teacher inference)
 ```
-**Fix**: `teacher.tensor_parallel_size=8` (increase TP)
+**Fix**: Use `teacher.precision="float16"` or reduce batch size (TP > 1 not supported)
 
 ### Training Too Slow
 ```
@@ -159,7 +163,7 @@ examples/
 ├── run_kd.py                      # Entry point
 ├── configs/kd/
     ├── qwen3_4B_to_1B.yaml         # Small example
-    ├── qwen3_32B_to_4B.yaml        # Production example
+    ├── qwen3_7B_to_1.5B.yaml       # Multi-node example
     └── README.md                   # Config guide
 
 rlkit/

@@ -39,6 +39,7 @@ class TeacherConfig(TypedDict):
     # Parallelism for teacher (if large model)
     tensor_parallel_size: NotRequired[int]
     pipeline_parallel_size: NotRequired[int]
+    expert_parallel_size: NotRequired[int]  # For MoE models
 
 
 class KDConfig(TypedDict):

@@ -21,14 +21,26 @@ This guide explains how to perform knowledge distillation (KD) in NeMo RL, where
 Launch a KD training job using the provided example configurations:
 
 ```bash
-# Small example (2 nodes, 8 GPUs total)
+# Example: 4B teacher → 1.5B student (2 nodes, 8 GPUs total)
 uv run examples/run_kd.py --config examples/configs/kd/qwen3_4B_to_1B.yaml
-
-# Production example (5 nodes, 40 GPUs total)
-uv run examples/run_kd.py --config examples/configs/kd/qwen3_32B_to_4B.yaml
 ```
 
 **Prerequisites**: Set your `HF_HOME`, `WANDB_API_KEY`, and run `huggingface-cli login` if using gated models.
+
+## ⚠️ Current Limitations
+
+**Tensor Parallelism Not Supported**: This implementation currently **does not support tensor parallelism** (TP > 1). Both teacher and student models must run with `tensor_parallel_size: 1`. This limits the maximum model size to what fits on a single GPU (~7B-14B depending on GPU memory).
+
+**Pipeline Parallelism Not Tested**: While `pipeline_parallel_size > 1` is not explicitly blocked, it has not been tested and may not work correctly with the teacher inference path. Use at your own risk.
+
+**Expert Parallelism Supported**: For MoE (Mixture of Experts) teacher models, you can use `expert_parallel_size > 1` to distribute experts across GPUs. This is useful for models like Mixtral, Qwen-MoE, or DeepSeek-MoE.
+
+**Workaround**: For larger models, use lower precision (`float16` or `bfloat16`) and techniques like:
+- Flash Attention 2
+- Gradient checkpointing
+- CPU offloading (if supported)
+
+**Future Work**: Vocab parallelism support is planned. See `docs/design-docs/kd-vocab-parallelism-future-work.md` for the design.
 
 ## What is Knowledge Distillation?
 
@@ -73,7 +85,7 @@ Higher temperatures produce softer probability distributions, transferring more 
 ### Good Use Cases
 
 ✅ **Model compression**: Deploy smaller models with similar performance
-- Example: 32B teacher → 4B student for inference efficiency
+- Example: 7B teacher → 1.5B student for inference efficiency
 
 ✅ **Transfer learning**: Distill knowledge from one domain to another
 - Example: General-purpose teacher → domain-specific student
@@ -103,7 +115,7 @@ A KD configuration has four main sections:
 
 ```yaml
 student_policy:
-  model_name: "Qwen/Qwen2.5-4B"
+  model_name: "Qwen/Qwen2.5-1.5B"
   tokenizer:
     name: ${student_policy.model_name}
   
@@ -116,8 +128,10 @@ student_policy:
   # Standard policy config (TP, optimizer, scheduler, etc.)
   dtensor_v2_cfg:
     enabled: true
-    tensor_parallel_size: 2
-    # ... other parallelism settings
+    tensor_parallel_size: 1  # TP > 1 not currently supported for KD
+    context_parallel_size: 1
+    pipeline_parallel_size: 1
+    expert_parallel_size: 1
   
   optimizer:
     name: "torch.optim.AdamW"
@@ -133,7 +147,7 @@ student_policy:
 
 ```yaml
 teacher:
-  model_name: "Qwen/Qwen2.5-32B"
+  model_name: "Qwen/Qwen2.5-7B"
   checkpoint_path: null  # Optional: load from local checkpoint
   precision: "float16"   # Lower precision for memory efficiency
   max_total_sequence_length: ${student_policy.max_total_sequence_length}
@@ -141,10 +155,10 @@ teacher:
   # Dedicated cluster for teacher inference
   cluster:
     num_nodes: 1
-    gpus_per_node: 8
+    gpus_per_node: 4
   
   # Parallelism for teacher (inference only)
-  tensor_parallel_size: 8
+  tensor_parallel_size: 1  # TP > 1 not currently supported for KD
   pipeline_parallel_size: 1
 ```
 
@@ -234,9 +248,9 @@ p_soft = softmax(logits / T)
 
 | Model Gap | Recommended T | Reasoning |
 |-----------|--------------|----------|
-| **Large gap** (32B → 1B) | 3.0 - 5.0 | More "dark knowledge" needed |
-| **Medium gap** (7B → 3B) | 2.0 - 3.0 | Standard KD range |
-| **Small gap** (4B → 3B) | 1.5 - 2.0 | Minimal softening |
+| **Large gap** (7B → 1B) | 3.0 - 5.0 | More "dark knowledge" needed |
+| **Medium gap** (4B → 1.5B) | 2.0 - 3.0 | Standard KD range |
+| **Small gap** (3B → 2B) | 1.5 - 2.0 | Minimal softening |
 | **Same architecture** | 2.0 | Hinton et al. (2015) default |
 
 **Effects of temperature**:
@@ -320,9 +334,10 @@ teacher:
 ### Sizing Guidelines
 
 **Teacher allocation**:
-- Rule of thumb: `teacher_gpus ≥ model_size / 3B`
-- 32B model → 8-16 GPUs (TP=8)
-- 7B model → 1-2 GPUs (TP=1 or 2)
+- **Note**: Currently TP=1 only, so teacher must fit on single GPU
+- 7B model → 1 GPU (with fp16/bf16)
+- 14B model → 1 GPU (A100 80GB with optimizations)
+- Larger models not currently supported (requires TP > 1)
 - Add more GPUs if teacher inference is slow (<30% of step time)
 
 **Student allocation**:
@@ -369,9 +384,9 @@ uv run examples/run_kd.py \\
 
 # Adjust cluster allocation
 uv run examples/run_kd.py \\
-  --config examples/configs/kd/qwen3_32B_to_4B.yaml \\
+  --config examples/configs/kd/qwen3_4B_to_1B.yaml \\
   cluster.num_nodes=10 \\
-  teacher.cluster.num_nodes=2
+  teacher.cluster.num_nodes=1
 
 # Change learning rate
 uv run examples/run_kd.py \\
@@ -392,9 +407,10 @@ Example Slurm script:
 #SBATCH --ntasks-per-node=1
 
 uv run examples/run_kd.py \\
-  --config examples/configs/kd/qwen3_32B_to_4B.yaml \\
-  cluster.num_nodes=5 \\
-  cluster.gpus_per_node=8
+  --config examples/configs/kd/qwen3_7B_to_1.5B.yaml \\
+  cluster.num_nodes=4 \\
+  cluster.gpus_per_node=8 \\
+  teacher.cluster.num_nodes=1
 ```
 
 ## Monitoring Training
@@ -447,7 +463,8 @@ Your training is healthy if:
 
 🔴 **`teacher_inference` > 50%** of step time:
 - Teacher is bottleneck → Increase `teacher.cluster.num_nodes`
-- Teacher TP too small → Increase `teacher.tensor_parallel_size`
+- Consider using lower precision (fp16 vs bf16)
+- Ensure teacher model fits on single GPU (TP > 1 not supported)
 
 ### Console Output
 
@@ -561,12 +578,12 @@ ValueError: teacher_logprobs must be provided in data dict for CombinedKDLoss
 **Fix**: Ensure both use the same tokenizer:
 ```yaml
 student_policy:
-  model_name: "Qwen/Qwen2.5-4B"
+  model_name: "Qwen/Qwen2.5-1.5B"
   tokenizer:
     name: ${student_policy.model_name}
 
 teacher:
-  model_name: "Qwen/Qwen2.5-32B"  # Must have same tokenizer
+  model_name: "Qwen/Qwen2.5-7B"  # Must have same tokenizer family
 ```
 
 #### Cluster Allocation Failure
@@ -592,10 +609,22 @@ teacher:
 **Symptoms**: CUDA OOM errors during teacher inference
 
 **Solutions**:
-1. Increase teacher tensor parallelism:
+1. **Note**: Tensor parallelism (TP > 1) not currently supported
+2. Use lower precision:
    ```yaml
    teacher:
-     tensor_parallel_size: 8  # Increase from 4
+     precision: "float16"  # Or "bfloat16"
+   ```
+3. Reduce batch size:
+   ```yaml
+   student_policy:
+     train_micro_batch_size: 2  # Reduce from 4
+   ```
+4. Use gradient checkpointing:
+   ```yaml
+   student_policy:
+     dtensor_v2_cfg:
+       activation_checkpointing: true
    ```
 
 2. Use lower precision:
@@ -683,14 +712,14 @@ KD works across architectures:
 
 ```yaml
 student_policy:
-  model_name: "Qwen/Qwen2.5-4B"  # Qwen architecture
+  model_name: "Qwen/Qwen2.5-1.5B"  # Qwen architecture
 
 teacher:
-  model_name: "meta-llama/Llama-3.1-70B"  # Llama architecture
+  model_name: "meta-llama/Llama-3.2-3B"  # Llama architecture
 ```
 
 **Requirements**:
-- Same tokenizer (or compatible tokenization)
+- Compatible tokenizer (same vocab)
 - Same vocab size
 - Same max sequence length
 
@@ -708,6 +737,32 @@ student_policy:
 
 Teacher inference is automatically run on packed sequences.
 
+### MoE Teacher Models with Expert Parallelism
+
+For Mixture-of-Experts (MoE) teachers, use expert parallelism to distribute experts across GPUs:
+
+```yaml
+teacher:
+  model_name: "mistralai/Mixtral-8x7B-v0.1"
+  expert_parallel_size: 4  # Distribute 8 experts across 4 GPUs
+  tensor_parallel_size: 1  # TP still not supported
+  cluster:
+    num_nodes: 1
+    gpus_per_node: 4
+```
+
+**Supported MoE models**: Mixtral, Qwen-MoE, DeepSeek-MoE, and other HuggingFace MoE architectures.
+
+**Why use EP for MoE teachers**:
+- Reduces memory per GPU (expert weights distributed)
+- Enables using larger MoE teachers that wouldn't fit on single GPU
+- Maintains full vocabulary logprobs needed for KD (unlike TP)
+
+**Configuration tips**:
+- Set `expert_parallel_size` to divide evenly into teacher GPU count
+- Use `precision: "float16"` to save memory
+- Monitor `teacher_inference` timing to ensure no bottleneck
+
 ### Checkpointing Teacher Metadata
 
 Checkpoints save teacher info for reproducibility:
@@ -715,7 +770,7 @@ Checkpoints save teacher info for reproducibility:
 ```python
 # Saved in checkpoint_dir/teacher_metadata.pt
 {
-    "model_name": "Qwen/Qwen2.5-32B",
+    "model_name": "Qwen/Qwen2.5-7B",
     "checkpoint_path": null,
     "precision": "float16",
 }

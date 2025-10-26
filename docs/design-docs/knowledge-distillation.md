@@ -2,6 +2,14 @@
 
 This document explains the design and implementation of the knowledge distillation (KD) feature in NeMo RL.
 
+## Current Limitations
+
+**Tensor Parallelism Not Supported**: This implementation currently **does not support tensor parallelism** (TP > 1). Both `teacher.tensor_parallel_size` and `student_policy.dtensor_v2_cfg.tensor_parallel_size` must be set to 1.
+
+**Impact**: Maximum model size is limited to what fits on a single GPU (~7B-14B models with fp16/bf16).
+
+**Future Work**: See `kd-vocab-parallelism-future-work.md` for the planned implementation.
+
 ## Overview
 
 Knowledge distillation allows a smaller **student** model to learn from a larger **teacher** model by minimizing the KL divergence between their output distributions. This implementation follows NeMo RL's existing patterns (similar to SFT/GRPO) and supports:
@@ -314,7 +322,7 @@ For reproducibility, we save teacher information:
 
 ```python
 teacher_metadata = {
-    "model_name": "Qwen/Qwen2.5-32B",
+    "model_name": "Qwen/Qwen2.5-7B",
     "checkpoint_path": "/path/to/teacher/checkpoint",
     "precision": "float16",
 }
@@ -456,22 +464,23 @@ Each cluster spawns worker groups that run on their dedicated GPUs.
 ### Parallelism Support
 
 **Teacher parallelism**:
-- Tensor Parallel (TP): Supported via `teacher.tensor_parallel_size`
-- Pipeline Parallel (PP): Supported via `teacher.pipeline_parallel_size`
-- Context Parallel (CP): Not typically needed for inference
+- **Tensor Parallel (TP): NOT SUPPORTED** (must be 1)
+- **Pipeline Parallel (PP): NOT SUPPORTED** (must be 1)
+- **Expert Parallel (EP): SUPPORTED** (for MoE models like Mixtral, Qwen-MoE)
+- Future work: See `kd-vocab-parallelism-future-work.md`
 
 **Student parallelism**:
-- Full support: TP, PP, CP, EP (expert parallel for MoE)
-- Same as SFT/GRPO
+- **Tensor Parallel (TP): NOT SUPPORTED** (must be 1)
+- Pipeline Parallel (PP), Context Parallel (CP), Expert Parallel (EP): Supported
 
 **Example**:
 ```yaml
 teacher:
-  tensor_parallel_size: 8  # 32B model across 8 GPUs
+  tensor_parallel_size: 1  # TP > 1 not currently supported
 
 student_policy:
   dtensor_v2_cfg:
-    tensor_parallel_size: 2  # 4B model across 2 GPUs
+    tensor_parallel_size: 1  # TP > 1 not currently supported
     pipeline_parallel_size: 1
 ```
 

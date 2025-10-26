@@ -551,7 +551,7 @@ class KDTrainer:
                     "pipeline_parallel_size", 1
                 ),
                 "context_parallel_size": 1,
-                "expert_parallel_size": 1,
+                "expert_parallel_size": teacher_config.get("expert_parallel_size", 1),
                 "cpu_offload": False,
                 "sequence_parallel": False,
                 "activation_checkpointing": False,

@@ -2,6 +2,12 @@
 
 This directory contains example configurations for knowledge distillation (KD) training.
 
+## ⚠️ Current Limitations
+
+**Tensor Parallelism Not Supported**: Both teacher and student must use `tensor_parallel_size: 1`. This limits model sizes to what fits on a single GPU (~7B-14B with fp16/bf16 on A100 80GB).
+
+**Expert Parallelism Supported**: For MoE teacher models, you can use `expert_parallel_size > 1` to distribute experts across GPUs.
+
 ## Available Configs
 
 ### `qwen3_4B_to_1B.yaml`
@@ -10,7 +16,7 @@ This directory contains example configurations for knowledge distillation (KD) t
 - **Student**: Qwen2.5-1.5B
 - **Teacher**: Qwen2.5-4B  
 - **Cluster**: 2 nodes × 4 GPUs = 8 GPUs total
-  - Teacher: 1 node × 4 GPUs (TP=2)
+  - Teacher: 1 node × 4 GPUs (TP=1)
   - Student: 1 node × 4 GPUs (TP=1)
 - **Training**:
   - Global batch size: 64
@@ -19,20 +25,35 @@ This directory contains example configurations for knowledge distillation (KD) t
   - Temperature: 2.0
 - **Use case**: Quick testing, development, small GPU clusters
 
-### `qwen3_32B_to_4B.yaml`
-**Production-scale example**
+### `qwen3_7B_to_1.5B.yaml`
+**Multi-node example**
 
-- **Student**: Qwen2.5-4B
-- **Teacher**: Qwen2.5-32B
-- **Cluster**: 5 nodes × 8 GPUs = 40 GPUs total
-  - Teacher: 1 node × 8 GPUs (TP=8)
-  - Student: 4 nodes × 8 GPUs (TP=2)
+- **Student**: Qwen2.5-1.5B
+- **Teacher**: Qwen2.5-7B
+- **Cluster**: 3 nodes × 8 GPUs = 24 GPUs total
+  - Teacher: 1 node × 8 GPUs (TP=1)
+  - Student: 2 nodes × 8 GPUs (TP=1)
 - **Training**:
   - Global batch size: 256
   - Max sequence length: 4096
-  - KD weight: 0.7 (emphasize teacher)
-  - Temperature: 3.0 (softer distributions)
-- **Use case**: Production distillation, large-scale clusters
+  - KD weight: 0.6
+  - Temperature: 2.5
+- **Use case**: Multi-node training, larger models
+
+### `qwen_moe_to_1.5B.yaml`
+**MoE teacher with expert parallelism**
+
+- **Student**: Qwen2.5-1.5B (dense model)
+- **Teacher**: Qwen2.5-14B-Instruct (MoE model placeholder)
+- **Cluster**: 2 nodes × 8 GPUs = 16 GPUs total
+  - Teacher: 1 node × 8 GPUs (TP=1, **EP=4**)
+  - Student: 1 node × 8 GPUs (TP=1)
+- **Training**:
+  - Global batch size: 64
+  - Max sequence length: 2048
+  - KD weight: 0.6
+  - Temperature: 2.5
+- **Use case**: Distilling MoE models to dense models, expert parallelism
 
 ## How to Run
 
@@ -42,8 +63,11 @@ This directory contains example configurations for knowledge distillation (KD) t
 # Small example (2 nodes)
 uv run examples/run_kd.py --config examples/configs/kd/qwen3_4B_to_1B.yaml
 
-# Large example (5 nodes)
-uv run examples/run_kd.py --config examples/configs/kd/qwen3_32B_to_4B.yaml
+# Multi-node example (3 nodes)
+uv run examples/run_kd.py --config examples/configs/kd/qwen3_7B_to_1.5B.yaml
+
+# MoE teacher with expert parallelism
+uv run examples/run_kd.py --config examples/configs/kd/qwen_moe_to_1.5B.yaml
 ```
 
 ### With Overrides
@@ -66,9 +90,9 @@ uv run examples/run_kd.py \\
 
 # Adjust cluster allocation
 uv run examples/run_kd.py \\
-  --config examples/configs/kd/qwen3_32B_to_4B.yaml \\
-  cluster.num_nodes=8 \\
-  teacher.cluster.num_nodes=2
+  --config examples/configs/kd/qwen3_7B_to_1.5B.yaml \\
+  cluster.num_nodes=4 \\
+  teacher.cluster.num_nodes=1
 ```
 
 ## Key Configuration Parameters
@@ -112,8 +136,10 @@ teacher:
 - **`teacher.model_name`**: HuggingFace model or path
 - **`teacher.checkpoint_path`**: (Optional) Local checkpoint to load
 - **`teacher.precision`**: "float16" or "bfloat16" (float16 saves memory)
-- **`teacher.tensor_parallel_size`**: TP for teacher model
-  - Rule of thumb: `model_size / 3B` (e.g., 32B → TP=8-10)
+- **`teacher.tensor_parallel_size`**: Must be 1 (TP > 1 not currently supported)
+- **`teacher.expert_parallel_size`**: For MoE models (e.g., Mixtral, Qwen-MoE)
+  - Distributes expert computation across GPUs
+  - Example: `expert_parallel_size: 2` for Mixtral-8x7B
 
 ### Student Configuration
 
@@ -133,8 +159,8 @@ Same as standard NeMo-RL policy configuration. Key differences:
 
 ### Choosing Temperature
 
-1. **Large gap** (32B → 1B): Use higher temperature (3.0-5.0)
-2. **Small gap** (7B → 3B): Use moderate temperature (2.0-3.0)
+1. **Large gap** (7B → 1B): Use higher temperature (3.0-5.0)
+2. **Medium gap** (4B → 1.5B): Use moderate temperature (2.0-3.0)
 3. **Same architecture**: Start with 2.0
 4. **Different architectures**: May need experimentation
 
@@ -196,4 +222,44 @@ ValueError: teacher_logprobs must be provided
 - Teacher bottleneck → Increase `teacher.cluster.num_nodes`
 - Student bottleneck → Increase student cluster allocation
 - Both slow → Reduce batch size or sequence length
+
+## Using MoE Teacher Models
+
+### Expert Parallelism
+
+For Mixture-of-Experts (MoE) teacher models, you can use expert parallelism to distribute expert computation across GPUs:
+
+```yaml
+teacher:
+  model_name: "mistralai/Mixtral-8x7B-v0.1"  # 8 experts
+  expert_parallel_size: 4  # Distribute across 4 GPUs
+  tensor_parallel_size: 1  # TP not supported
+  cluster:
+    num_nodes: 1
+    gpus_per_node: 4
+```
+
+### Supported MoE Models
+
+- **Mixtral**: `mistralai/Mixtral-8x7B-v0.1`, `mistralai/Mixtral-8x22B-v0.1`
+- **Qwen-MoE**: Any Qwen2.5 MoE variant
+- **DeepSeek-MoE**: DeepSeek MoE models
+- **Custom MoE**: Any HuggingFace MoE architecture
+
+### EP Configuration Guidelines
+
+**Choosing expert_parallel_size**:
+- Should divide evenly into the number of GPUs allocated to teacher
+- Typical values: 2, 4, 8 depending on model size and GPU count
+- Example: Mixtral-8x7B with EP=4 puts 2 experts per GPU
+
+**Memory considerations**:
+- EP reduces memory per GPU (distributes expert weights)
+- Still limited by TP=1 constraint (shared layers must fit on single GPU)
+- Use lower precision (`float16`) if memory constrained
+
+**Performance**:
+- EP adds communication overhead for expert routing
+- Best for inference-heavy workloads (like teacher in KD)
+- Monitor `teacher_inference` timing to ensure not a bottleneck
 
