@@ -52,6 +52,16 @@ from rlkit.utils.nsys import maybe_gpu_profile_step
 import ray
 
 
+# Default timeout values for KD operations
+DEFAULT_TEACHER_INFERENCE_TIMEOUT = 300  # 5 minutes
+DEFAULT_VALIDATION_TIMEOUT = 600  # 10 minutes
+DEFAULT_CHECKPOINTING_TIMEOUT = 120  # 2 minutes
+
+# Default validation settings
+DEFAULT_VAL_PERIOD = 100  # Validate every 100 steps
+DEFAULT_VAL_BATCHES = 10  # Number of validation batches
+
+
 class KDValidationMetrics(TypedDict):
     """Validation metrics for knowledge distillation."""
     val_loss: float
@@ -514,6 +524,16 @@ class KDTrainer:
         # Get vocab size from tokenizer
         vocab_size = len(self.tokenizer)
         
+        # Validate sequence lengths match
+        student_max_len = self.master_config["student_policy"]["max_total_sequence_length"]
+        teacher_max_len = self.master_config["teacher"]["max_total_sequence_length"]
+        
+        if student_max_len != teacher_max_len:
+            raise ValueError(
+                f"Teacher and student must have the same max_total_sequence_length. "
+                f"student={student_max_len}, teacher={teacher_max_len}"
+            )
+
         logging.info(f"  ✓ Tokenizer validation passed (vocab_size={vocab_size})")
     
     def _process_batch(self, batch: BatchedDataDict) -> BatchedDataDict:
@@ -741,18 +761,18 @@ class KDTrainer:
                 
                 with timer.time("total_step_time"):
                     # 1. Process batch
-                    logging.info("Processing batch...")
+                    logging.debug("Processing batch...")
                     with timer.time("data_processing"):
                         train_data = self._process_batch(batch)
                     
-                    # 2. Get teacher logits (synchronous)
-                    logging.info("Computing teacher logits...")
+                    # 2. Get teacher log probabilities (synchronous)
+                    logging.debug("Computing teacher log probabilities...")
                     with timer.time("teacher_inference"):
                         teacher_logprobs = await self._get_teacher_logprobs(train_data)
                         train_data["teacher_logprobs"] = teacher_logprobs
                     
                     # 3. Train student
-                    logging.info("Training student policy...")
+                    logging.debug("Training student policy...")
                     with timer.time("student_training"):
                         train_results = await self.student_policy.train(
                             train_data, 
@@ -871,6 +891,23 @@ class KDTrainer:
             self.checkpointer.finalize_checkpoint(checkpoint_path)
             logging.info(f"  ✓ Checkpoint saved to {checkpoint_path}")
     
+    def _log_timing_metrics(self, timing_metrics: dict, step: int) -> None:
+        """Log timing metrics to console and tracking systems."""
+        total_time = timing_metrics.get("total_step_time", 0)
+        
+        logging.info("\n  ⏱️  Timing:")
+        logging.info(f"  • Total step time: {total_time:.2f}s")
+        
+        for k, v in sorted(
+            timing_metrics.items(), key=lambda item: item[1], reverse=True
+        ):
+            if k != "total_step_time":
+                percent = (v / total_time * 100) if total_time > 0 else 0
+                logging.info(f"  • {k}: {v:.2f}s ({percent:.1f}%)")
+        
+        # Log to tracking systems
+        self.logger.log_metrics(timing_metrics, step, prefix="timing/train")
+    
     def _log_training_step(
         self, step: int, train_results: dict, timer: Timer
     ) -> None:
@@ -907,17 +944,8 @@ class KDTrainer:
             logging.info(f"  • Temperature: {metrics['temperature']:.2f}")
         logging.info(f"  • Grad Norm: {metrics['grad_norm']:.4f}")
         
-        logging.info("\n  ⏱️  Timing:")
-        total_time = timing_metrics.get("total_step_time", 0)
-        logging.info(f"  • Total step time: {total_time:.2f}s")
+        # Log timing metrics using utility method
+        self._log_timing_metrics(timing_metrics, step)
         
-        for k, v in sorted(
-            timing_metrics.items(), key=lambda item: item[1], reverse=True
-        ):
-            if k != "total_step_time":
-                percent = (v / total_time * 100) if total_time > 0 else 0
-                logging.info(f"  • {k}: {v:.2f}s ({percent:.1f}%)")
-        
-        # Log to tracking systems (wandb, tensorboard, etc.)
+        # Log metrics to tracking systems
         self.logger.log_metrics(metrics, step, prefix="train")
-        self.logger.log_metrics(timing_metrics, step, prefix="timing/train")

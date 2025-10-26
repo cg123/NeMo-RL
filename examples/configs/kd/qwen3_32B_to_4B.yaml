@@ -10,7 +10,7 @@ cluster:
 student_policy:
   model_name: "Qwen/Qwen2.5-4B"
   tokenizer:
-    name: \${student_policy.model_name}
+    name: ${student_policy.model_name}
   
   train_global_batch_size: 256
   train_micro_batch_size: 4
@@ -31,12 +31,12 @@ student_policy:
   
   sequence_packing:
     enabled: true
-    train_mb_tokens: \${mul:\${student_policy.max_total_sequence_length}, \${student_policy.train_micro_batch_size}}
-    logprob_mb_tokens: \${mul:\${student_policy.max_total_sequence_length}, \${student_policy.logprob_batch_size}}
+    train_mb_tokens: ${mul:${student_policy.max_total_sequence_length}, ${student_policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${student_policy.max_total_sequence_length}, ${student_policy.logprob_batch_size}}
     algorithm: "modified_first_fit_decreasing"
     sequence_length_round: 64
   
-  make_sequence_length_divisible_by: \${student_policy.dtensor_v2_cfg.tensor_parallel_size}
+  make_sequence_length_divisible_by: ${student_policy.dtensor_v2_cfg.tensor_parallel_size}
   max_grad_norm: 1.0
   
   optimizer:
@@ -66,7 +66,7 @@ teacher:
   model_name: "Qwen/Qwen2.5-32B"
   checkpoint_path: null  # Load from HuggingFace
   precision: "float16"  # Lower precision for memory efficiency
-  max_total_sequence_length: \${student_policy.max_total_sequence_length}
+  max_total_sequence_length: ${student_policy.max_total_sequence_length}
   
   # Dedicate 1 node (8 GPUs) to teacher
   cluster:
@@ -99,7 +99,7 @@ data:
   dataset_name: "HuggingFaceH4/ultrachat_200k"  # Example: replace with your dataset
   dataset_type: "chat"
   on_disk: false
-  max_input_seq_length: \${student_policy.max_total_sequence_length}
+  max_input_seq_length: ${student_policy.max_total_sequence_length}
   shuffle: true
 
 # Checkpointing

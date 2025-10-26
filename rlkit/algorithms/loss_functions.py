@@ -646,21 +646,21 @@ class KnowledgeDistillationLoss(LossFunction):
         teacher_logprobs_normalized = teacher_logprobs_temp_scaled - torch.logsumexp(
             teacher_logprobs_temp_scaled, dim=-1, keepdim=True
         )
-        teacher_probs = torch.exp(teacher_logprobs_normalized)
         
-        # Compute KL divergence: KL(P||Q) = sum(P * log(P/Q)) = sum(P * (log(P) - log(Q)))
+        # Compute KL divergence in log space for numerical stability
         kl_div = torch.nn.functional.kl_div(
             student_log_probs, 
-            teacher_probs, 
+            teacher_logprobs_normalized, 
             reduction='none',
-            log_target=False
+            log_target=True  # Both student and teacher are log probabilities
         )
         
         # Sum over vocabulary dimension
         kl_div = kl_div.sum(dim=-1)  # [batch, seq_len]
         
-        # Scale by T^2 (standard in KD literature)
+        # Scale by T^2 to preserve gradient magnitudes (Hinton et al. 2015)
         kl_div = kl_div * (T ** 2)
+        # This ensures distillation loss magnitude is comparable to base loss
         
         # Apply token-level masking
         masked_kl = masked_mean(
@@ -720,7 +720,7 @@ class CombinedKDLoss(LossFunction):
         
         Args:
             next_token_logits: Student model logits
-            data: BatchedDataDict with labels and teacher_logits
+            data: BatchedDataDict with labels and teacher_logprobs
             global_valid_seqs: Number of valid sequences
             global_valid_toks: Number of valid tokens
             vocab_parallel_rank: Vocab parallel rank
@@ -741,7 +741,7 @@ class CombinedKDLoss(LossFunction):
             context_parallel_group,
         )
         
-        # Teacher logits must be provided for KD training
+        # Teacher log probabilities must be provided for KD training
         if "teacher_logprobs" not in data or data["teacher_logprobs"] is None:
             raise ValueError(
                 "teacher_logprobs must be provided in data dict for CombinedKDLoss. "

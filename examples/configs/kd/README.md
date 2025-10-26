@@ -159,7 +159,7 @@ ValueError: No nodes remaining for student training
 
 **Tokenizer mismatch**:
 ```
-ValueError: teacher_logits must be provided
+ValueError: teacher_logprobs must be provided
 ```
 → Check that teacher and student use compatible tokenizers
 
