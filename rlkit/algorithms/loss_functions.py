@@ -726,34 +726,32 @@ class CombinedKDLoss(LossFunction):
             context_parallel_group,
         )
         
-        # Compute KD loss if teacher logits available
-        if "teacher_logits" in data and data["teacher_logits"] is not None:
-            kd_loss_val, kd_metrics = self.kd_loss(
-                next_token_logits,
-                data,
-                global_valid_seqs,
-                global_valid_toks,
-                vocab_parallel_rank,
-                vocab_parallel_group,
-                context_parallel_group,
+        # Teacher logits must be provided for KD training
+        if "teacher_logits" not in data or data["teacher_logits"] is None:
+            raise ValueError(
+                "teacher_logits must be provided in data dict for CombinedKDLoss. "
+                "Ensure teacher inference is run before student training."
             )
-            
-            # Combine losses: (1-α)*base + α*kd
-            total_loss = (1 - self.kd_weight) * base_loss_val + self.kd_weight * kd_loss_val
-            
-            metrics = {
-                **base_metrics,
-                **kd_metrics,
-                "base_loss": base_loss_val.item(),
-                "kd_weight": self.kd_weight,
-                "total_loss": total_loss.item(),
-            }
-        else:
-            # Fallback to base loss only (useful for validation without teacher)
-            total_loss = base_loss_val
-            metrics = {
-                **base_metrics,
-                "total_loss": total_loss.item(),
-            }
+        
+        kd_loss_val, kd_metrics = self.kd_loss(
+            next_token_logits,
+            data,
+            global_valid_seqs,
+            global_valid_toks,
+            vocab_parallel_rank,
+            vocab_parallel_group,
+            context_parallel_group,
+        )
+        
+        # Combine losses: (1-α)*base + α*kd
+        total_loss = (1 - self.kd_weight) * base_loss_val + self.kd_weight * kd_loss_val
+        
+        metrics = {
+            **base_metrics,
+            **kd_metrics,
+            "base_loss": base_loss_val.item(),
+            "kd_weight": self.kd_weight,
+            "total_loss": total_loss.item(),
+        }
         
         return total_loss, metrics
