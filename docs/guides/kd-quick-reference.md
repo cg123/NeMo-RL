@@ -4,7 +4,7 @@ A cheat sheet for common KD operations in NeMo RL.
 
 ## ⚠️ Current Limitations
 
-**Tensor Parallelism Not Supported**: Both teacher and student must use `tensor_parallel_size: 1`. Models must fit on single GPU (~7B-14B with fp16/bf16).
+**Tensor Parallelism Not Supported**: Both teacher and student must use `tensor_parallel_size: 1`. Models must fit on single GPU (~7B-70B depending on GPU memory and precision).
 
 ## Launch Commands
 

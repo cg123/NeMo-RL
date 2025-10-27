@@ -6,7 +6,7 @@ This document explains the design and implementation of the knowledge distillati
 
 **Tensor Parallelism Not Supported**: This implementation currently **does not support tensor parallelism** (TP > 1). Both `teacher.tensor_parallel_size` and `student_policy.dtensor_v2_cfg.tensor_parallel_size` must be set to 1.
 
-**Impact**: Maximum model size is limited to what fits on a single GPU (~7B-14B models with fp16/bf16).
+**Impact**: Maximum model size is limited to what fits on a single GPU (~7B-70B models depending on GPU memory and precision).
 
 **Future Work**: See `kd-vocab-parallelism-future-work.md` for the planned implementation.
 

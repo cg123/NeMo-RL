@@ -29,7 +29,7 @@ uv run examples/run_kd.py --config examples/configs/kd/qwen3_4B_to_1B.yaml
 
 ## ⚠️ Current Limitations
 
-**Tensor Parallelism Not Supported**: This implementation currently **does not support tensor parallelism** (TP > 1). Both teacher and student models must run with `tensor_parallel_size: 1`. This limits the maximum model size to what fits on a single GPU (~7B-14B depending on GPU memory).
+**Tensor Parallelism Not Supported**: This implementation currently **does not support tensor parallelism** (TP > 1). Both teacher and student models must run with `tensor_parallel_size: 1`. This limits the maximum model size to what fits on a single GPU (~7B-70B depending on GPU memory and precision).
 
 **Pipeline Parallelism Not Tested**: While `pipeline_parallel_size > 1` is not explicitly blocked, it has not been tested and may not work correctly with the teacher inference path. Use at your own risk.
 

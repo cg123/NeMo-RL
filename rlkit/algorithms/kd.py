@@ -480,39 +480,25 @@ class KDTrainer:
         return teacher
 
     def _validate_tokenizers(self) -> None:
-        """Validate student and teacher use compatible tokenizers.
-
-        Ensures:
-        - Same vocab size
-        - Same tokenization for test string
+        """Validate student and teacher have compatible sequence lengths.
+        
+        Note: Both teacher and student currently use the same tokenizer object,
+        so vocabulary compatibility is guaranteed.
         """
-        # Test tokenization consistency
-        test_text = "Hello, world! This is a test."
-        test_tokens = self.tokenizer(test_text, return_tensors="pt")
-
-        # Get vocab size from tokenizer
+        # Log vocab size for reference
         vocab_size = len(self.tokenizer)
-
-        # Validate vocab size consistency
-        # Note: Both teacher and student use the same tokenizer object in current implementation,
-        # so this check is somewhat redundant. However, it's here for future-proofing in case
-        # we support different tokenizers for teacher/student.
-        if vocab_size <= 0:
-            raise ValueError(f"Invalid vocabulary size: {vocab_size}. " f"Tokenizer may not be properly initialized.")
-
-        logging.info(f"  ✓ Vocabulary size: {vocab_size}")
+        logging.info(f"  ✓ Shared tokenizer vocabulary size: {vocab_size}")
 
         # Validate sequence lengths match
         student_max_len = self.master_config["student_policy"]["max_total_sequence_length"]
         teacher_max_len = self.master_config["teacher"]["max_total_sequence_length"]
 
-        if student_max_len != teacher_max_len:
-            raise ValueError(
-                f"Teacher and student must have the same max_total_sequence_length. "
-                f"student={student_max_len}, teacher={teacher_max_len}"
-            )
-
-        logging.info(f"  ✓ Tokenizer validation passed (vocab_size={vocab_size})")
+        assert student_max_len == teacher_max_len, (
+            f"Teacher and student must have the same max_total_sequence_length: "
+            f"student={student_max_len}, teacher={teacher_max_len}"
+        )
+        
+        logging.info(f"  ✓ Sequence length validated: {student_max_len}")
 
     def _process_batch(self, batch: BatchedDataDict) -> BatchedDataDict:
         """Process batch for training (reuse SFT pattern).
