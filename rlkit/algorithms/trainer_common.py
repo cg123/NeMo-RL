@@ -198,25 +198,25 @@ def save_training_checkpoint(
         timer: Optional Timer for timing checkpoint saving
     """
     context = timer.time("checkpointing") if timer else None
-    
+
     if context:
         context.__enter__()
-    
+
     try:
         logging.info(f"Saving checkpoint for step {step}...")
         checkpoint_path = checkpointer.init_tmp_checkpoint(step, save_state, master_config)
-        
+
         policy.save_checkpoint(
             weights_path=os.path.join(checkpoint_path, policy_subdir, "weights"),
             optimizer_path=os.path.join(checkpoint_path, policy_subdir, "optimizer"),
             tokenizer_path=os.path.join(checkpoint_path, policy_subdir, "tokenizer"),
         )
-        
+
         torch.save(
             dataloader.state_dict(),
             os.path.join(checkpoint_path, "train_dataloader.pt"),
         )
-        
+
         checkpointer.finalize_checkpoint(checkpoint_path)
         logging.info(f"  ✓ Checkpoint saved to {checkpoint_path}")
     finally:
@@ -266,7 +266,7 @@ def setup_dataloader(
     """
     if collate_fn is None:
         collate_fn = dict_list_collate_fn
-    
+
     dataloader = StatefulDataLoader(
         dataset,
         batch_size=batch_size,
@@ -274,13 +274,13 @@ def setup_dataloader(
         collate_fn=collate_fn,
         drop_last=drop_last,
     )
-    
+
     if last_checkpoint_path is not None:
         dataloader_state_path = os.path.join(last_checkpoint_path, "train_dataloader.pt")
         if os.path.exists(dataloader_state_path):
             dataloader_state_dict = torch.load(dataloader_state_path)
             dataloader.load_state_dict(dataloader_state_dict)
-    
+
     return dataloader
 
 
@@ -324,11 +324,7 @@ def initialize_policy(
 
     if last_checkpoint_path:
         weights_path = Path(last_checkpoint_path) / policy_subdir / "weights"
-        optimizer_path = (
-            Path(last_checkpoint_path) / policy_subdir / "optimizer"
-            if init_optimizer
-            else None
-        )
+        optimizer_path = Path(last_checkpoint_path) / policy_subdir / "optimizer" if init_optimizer else None
 
     return Policy(
         cluster=cluster,
@@ -371,8 +367,7 @@ def create_cluster(
         max_colocated_worker_groups=max_colocated_worker_groups,
     )
     logging.info(
-        f"  ✓ {name} initialized with {cluster_config['num_nodes']} nodes "
-        f"× {cluster_config['gpus_per_node']} GPUs"
+        f"  ✓ {name} initialized with {cluster_config['num_nodes']} nodes " f"× {cluster_config['gpus_per_node']} GPUs"
     )
     return cluster
 
@@ -559,27 +554,17 @@ def calculate_and_log_tflops(
     if "total_flops" not in train_results:
         return None
 
-    total_tflops = (
-        train_results["total_flops"]
-        / timing_metrics["policy_training"]
-        / 1e12
-    )
+    total_tflops = train_results["total_flops"] / timing_metrics["policy_training"] / 1e12
     num_ranks = train_results["num_ranks"]
 
-    logging.info(
-        f"  • Training FLOPS: {total_tflops:.2f} TFLOPS "
-        f"({total_tflops / num_ranks:.2f} TFLOPS per rank)"
-    )
+    logging.info(f"  • Training FLOPS: {total_tflops:.2f} TFLOPS " f"({total_tflops / num_ranks:.2f} TFLOPS per rank)")
 
     metrics = {}
 
     if "theoretical_tflops" in train_results:
         theoretical_tflops = train_results["theoretical_tflops"]
         fp_utilization = total_tflops / theoretical_tflops
-        logging.info(
-            f"  • Training Model Floating Point Utilization: "
-            f"{100 * fp_utilization:.2f}%"
-        )
+        logging.info(f"  • Training Model Floating Point Utilization: " f"{100 * fp_utilization:.2f}%")
         metrics["train_fp_utilization"] = fp_utilization
 
     return metrics
@@ -642,9 +627,7 @@ def process_supervised_batch(
     truncated = 0
 
     if run_vram_torture_test:
-        logging.warning(
-            "Filling batch with BOS token to test VRAM usage. Do not use this for training!"
-        )
+        logging.warning("Filling batch with BOS token to test VRAM usage. Do not use this for training!")
 
     for i, (input_ids, token_mask, sample_mask) in enumerate(
         zip(batch["input_ids"], batch["token_mask"], batch["sample_mask"])
@@ -652,9 +635,7 @@ def process_supervised_batch(
         # Run VRAM torture test by filling the batch with BOS tokens
         if run_vram_torture_test:
             train_data["input_ids"][i] = torch.tensor([input_ids[0]] * max_seq_len)
-            train_data["token_mask"][i] = torch.ones_like(
-                train_data["input_ids"][i]
-            )
+            train_data["token_mask"][i] = torch.ones_like(train_data["input_ids"][i])
             train_data["sample_mask"][i] = torch.tensor(1.0)
             train_data["input_lengths"][i] = torch.tensor(max_seq_len)
             continue
@@ -673,9 +654,7 @@ def process_supervised_batch(
             pad_value=tokenizer_pad_token_id,
         )
         train_data["input_lengths"][i] = torch.tensor(len(input_ids))
-        train_data["token_mask"][i] = _pad_tensor(
-            torch.tensor(token_mask), max_batch_len, "right", pad_value=0
-        )
+        train_data["token_mask"][i] = _pad_tensor(torch.tensor(token_mask), max_batch_len, "right", pad_value=0)
         train_data["sample_mask"][i] = torch.tensor(sample_mask)
 
     if truncated > 0:
@@ -686,12 +665,63 @@ def process_supervised_batch(
 
     return BatchedDataDict({k: torch.stack(v) for k, v in train_data.items()})
 
+
+def process_preference_batch(
+    batch: dict[str, Any],
+    tokenizer: "PreTrainedTokenizerBase",
+    max_seq_len: int,
+    roles_to_train_on: list[str] = None,
+) -> "BatchedDataDict":
+    """Process batch for preference-based training (RM).
+
+    Converts message logs into tokenized preference data.
+
+    Args:
+        batch: Input batch with 'message_log' and 'loss_multiplier' fields
+        tokenizer: Tokenizer for padding
+        max_seq_len: Maximum sequence length
+        roles_to_train_on: Which message roles to train on (default: ["assistant"])
+
+    Returns:
+        BatchedDataDict with processed preference data
+    """
+    from rlkit.data.llm_message_utils import (
+        add_loss_mask_to_message_log,
+        batched_message_log_to_flat_message,
+    )
+    from rlkit.distributed.batched_data_dict import BatchedDataDict
+
+    if roles_to_train_on is None:
+        roles_to_train_on = ["assistant"]
+
+    # Add loss mask based on role to every message
+    add_loss_mask_to_message_log(
+        batch["message_log"],
+        roles_to_train_on=roles_to_train_on,
+    )
+
+    cat_and_padded, input_lengths = batched_message_log_to_flat_message(
+        batch["message_log"],
+        pad_value_dict={"token_ids": tokenizer.pad_token_id},
+        make_sequence_length_divisible_by=max_seq_len,
+    )
+
+    return BatchedDataDict(
+        {
+            "input_ids": cat_and_padded["token_ids"],
+            "input_lengths": input_lengths,
+            "token_mask": cat_and_padded["token_loss_mask"],
+            "sample_mask": batch["loss_multiplier"],
+        }
+    )
+
+
 # ===============================================================================
 # Validation Helpers
 # ===============================================================================
 
 
-def run_validation_loop(
+async def run_validation_loop(
     val_dataloader: Any,
     policy: Any,
     loss_fn: Any,
@@ -719,7 +749,7 @@ def run_validation_loop(
         process_batch_fn: Function to process raw batch into model input
         metric_names: List of metric names to log (in order)
         accumulate_metrics_fn: Optional custom function to accumulate metrics
-        prepare_data_fn: Optional function to prepare data before policy.train()
+        prepare_data_fn: Optional function (sync or async) to prepare data before policy.train()
 
     Returns:
         Tuple of (val_metrics, timing_metrics) or None if no valid batches
@@ -747,11 +777,17 @@ def run_validation_loop(
             val_data = process_batch_fn(raw_val_batch)
 
             # Optional additional data preparation (e.g., KD teacher logprobs)
+            # Support both sync and async prepare_data_fn
             if prepare_data_fn:
-                val_data = prepare_data_fn(val_data)
+                import inspect
+
+                if inspect.iscoroutinefunction(prepare_data_fn):
+                    val_data = await prepare_data_fn(val_data)
+                else:
+                    val_data = prepare_data_fn(val_data)
 
             # Run validation
-            val_results = policy.train(
+            val_results = await policy.train(
                 val_data,
                 loss_fn,
                 eval_mode=True,

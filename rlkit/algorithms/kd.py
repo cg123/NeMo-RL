@@ -454,7 +454,7 @@ class KDTrainer:
 
     def _validate_tokenizers(self) -> None:
         """Validate student and teacher have compatible sequence lengths.
-        
+
         Note: Both teacher and student currently use the same tokenizer object,
         so vocabulary compatibility is guaranteed.
         """
@@ -470,7 +470,7 @@ class KDTrainer:
             f"Teacher and student must have the same max_total_sequence_length: "
             f"student={student_max_len}, teacher={teacher_max_len}"
         )
-        
+
         logging.info(f"  ✓ Sequence length validated: {student_max_len}")
 
     async def _get_teacher_logprobs(self, data: BatchedDataDict) -> torch.Tensor:
@@ -507,106 +507,50 @@ class KDTrainer:
         Returns:
             Optional tuple of (validation_metrics, timing_metrics)
         """
-        if self.val_dataloader is None:
-            logging.info("No validation dataloader provided, skipping validation")
-            return None
-
-        timer = Timer()
         kd_config = self.master_config["kd"]
 
-        with timer.time("total_validation_time"):
-            logging.info(f"▶ Starting validation at step {step}...")
+        async def prepare_data_fn(val_data):
+            """Prepare data by adding teacher logprobs."""
+            teacher_logprobs = await self._get_teacher_logprobs(val_data)
+            val_data["teacher_logprobs"] = teacher_logprobs
+            return val_data
 
-            val_metrics = {"val_loss": 0.0, "val_base_loss": 0.0, "val_kd_loss": 0.0}
-            num_valid_batches = 0
-
-            self.student_policy.prepare_for_training()
-
-            max_val_batches = kd_config.get("val_batches", -1)
-            for batch_idx, raw_val_batch in enumerate(self.val_dataloader):
-                # Stop if we've reached the max validation batches
-                if max_val_batches > 0 and batch_idx >= max_val_batches:
-                    break
-                val_batch = BatchedDataDict(raw_val_batch)
-
-                # Process batch
-                val_data = trainer_common.process_supervised_batch(
-                    val_batch,
-                    max_seq_len=self.master_config["student_policy"]["max_total_sequence_length"],
-                    tokenizer_pad_token_id=self.tokenizer.pad_token_id,
-                )
-
-                # Get teacher log probabilities
-                teacher_logprobs = await self._get_teacher_logprobs(val_data)
-                val_data["teacher_logprobs"] = teacher_logprobs
-
-                # Run validation (eval_mode=True, no gradient updates)
-                val_results = await self.student_policy.train(
-                    val_data,
-                    self.loss_fn,
-                    eval_mode=True,
-                    gbs=kd_config["val_global_batch_size"],
-                    mbs=kd_config["val_micro_batch_size"],
-                )
-
-                if len(val_results["all_mb_metrics"]) == 0:
-                    warnings.warn(
-                        "No validation metrics were collected for this batch. "
-                        "This is likely because there were no valid samples."
-                    )
-                else:
-                    val_metrics["val_loss"] += float(val_results["loss"])
-                    # Average component losses across all microbatches
-                    if "all_mb_metrics" in val_results and len(val_results["all_mb_metrics"]) > 0:
-                        # Accumulate across all microbatches for this validation batch
-                        batch_base_loss = sum(mb.get("base_loss", 0.0) for mb in val_results["all_mb_metrics"])
-                        batch_kd_loss = sum(mb.get("kd_loss", 0.0) for mb in val_results["all_mb_metrics"])
-                        num_mbs = len(val_results["all_mb_metrics"])
-                        val_metrics["val_base_loss"] += batch_base_loss / num_mbs if num_mbs > 0 else 0.0
-                        val_metrics["val_kd_loss"] += batch_kd_loss / num_mbs if num_mbs > 0 else 0.0
-                    num_valid_batches += 1
-
-                # Limit validation batches if configured
-                if kd_config["val_batches"] > 0 and batch_idx >= kd_config["val_batches"] - 1:
-                    break
-
-            if num_valid_batches > 0:
-                val_metrics["val_loss"] /= num_valid_batches
-                val_metrics["val_base_loss"] /= num_valid_batches
-                val_metrics["val_kd_loss"] /= num_valid_batches
-            else:
-                # Set metrics to NaN when no valid batches to avoid confusion
-                val_metrics["val_loss"] = float("nan")
-                val_metrics["val_base_loss"] = float("nan")
-                val_metrics["val_kd_loss"] = float("nan")
-                warnings.warn(
-                    "No validation metrics were collected. "
-                    "This is likely because there were no valid samples in the validation set."
-                )
-
-            self.student_policy.prepare_for_training()
-
-        timing_metrics = timer.get_timing_metrics(reduction_op="sum")
-
-        if num_valid_batches > 0:
-            logging.info("\n📊 Validation Results:")
-            logging.info(f"    • Validation loss: {val_metrics['val_loss']:.4f}")
-            logging.info(f"    • Base loss: {val_metrics['val_base_loss']:.4f}")
-            logging.info(f"    • KD loss: {val_metrics['val_kd_loss']:.4f}")
-
-            trainer_common.log_validation_results(
-                val_metrics,
-                timing_metrics,
-                step,
-                self.logger,
-                metric_names=["val_loss", "val_base_loss", "val_kd_loss"],
+        def process_batch_fn(raw_batch):
+            """Process raw batch into model input."""
+            val_batch = BatchedDataDict(raw_batch)
+            return trainer_common.process_supervised_batch(
+                val_batch,
+                max_seq_len=self.master_config["student_policy"]["max_total_sequence_length"],
+                tokenizer_pad_token_id=self.tokenizer.pad_token_id,
             )
-        else:
-            # Still log timing even if no valid batches
-            self.logger.log_metrics(timing_metrics, step, prefix="timing/validation")
 
-        timer.reset()
-        return val_metrics, timing_metrics
+        def accumulate_metrics_fn(val_metrics, val_results):
+            """Accumulate validation metrics including KD components."""
+            val_metrics["val_loss"] += float(val_results["loss"])
+            # Average component losses across all microbatches
+            if "all_mb_metrics" in val_results and len(val_results["all_mb_metrics"]) > 0:
+                batch_base_loss = sum(mb.get("base_loss", 0.0) for mb in val_results["all_mb_metrics"])
+                batch_kd_loss = sum(mb.get("kd_loss", 0.0) for mb in val_results["all_mb_metrics"])
+                num_mbs = len(val_results["all_mb_metrics"])
+                val_metrics["val_base_loss"] += batch_base_loss / num_mbs if num_mbs > 0 else 0.0
+                val_metrics["val_kd_loss"] += batch_kd_loss / num_mbs if num_mbs > 0 else 0.0
+
+        result = await trainer_common.run_validation_loop(
+            val_dataloader=self.val_dataloader,
+            policy=self.student_policy,
+            loss_fn=self.loss_fn,
+            step=step,
+            logger=self.logger,
+            max_val_batches=kd_config.get("val_batches", -1),
+            val_global_batch_size=kd_config["val_global_batch_size"],
+            val_micro_batch_size=kd_config["val_micro_batch_size"],
+            process_batch_fn=process_batch_fn,
+            metric_names=["val_loss", "val_base_loss", "val_kd_loss"],
+            accumulate_metrics_fn=accumulate_metrics_fn,
+            prepare_data_fn=prepare_data_fn,
+        )
+
+        return result
 
     async def train(self) -> None:
         """Main training loop for knowledge distillation."""
@@ -776,9 +720,7 @@ class KDTrainer:
         """Log training metrics."""
         # Prepare metrics (KD has special mean keys for alpha and temperature)
         mean_keys = {"lr", "wd", "global_valid_seqs", "global_valid_toks", "alpha", "temperature"}
-        metrics = trainer_common.prepare_training_metrics(
-            train_results, mean_keys=mean_keys
-        )
+        metrics = trainer_common.prepare_training_metrics(train_results, mean_keys=mean_keys)
 
         timing_metrics = timer.get_timing_metrics(reduction_op="sum")
 

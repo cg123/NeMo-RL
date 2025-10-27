@@ -76,20 +76,20 @@ class SFTTrainer:
         master_config: MasterConfig,
         tokenizer: AutoTokenizer,
         train_dataset: Dataset,
-        val_dataset: Optional[Dataset]
+        val_dataset: Optional[Dataset],
     ) -> None:
         self.master_config = master_config
         self.tokenizer = tokenizer
         self.train_dataset = train_dataset
         self.val_dataset = val_dataset
-        
+
         policy_config = self.master_config["policy"]
         cluster_config = self.master_config["cluster"]
 
         set_seed(master_config["sft"]["seed"])
 
         self.logger = trainer_common.setup_logger(master_config["logger"], self.master_config)
-        
+
         (
             self.checkpointer,
             self.sft_save_state,
@@ -107,28 +107,22 @@ class SFTTrainer:
             sft_config=master_config["sft"],
             last_checkpoint_path=last_checkpoint_path,
         )
-        
+
         logging.info("Setting up compute cluster...")
 
         self.cluster = trainer_common.create_cluster("sft_train_cluster", cluster_config)
-        
+
         if last_checkpoint_path:
             weights_path = Path(last_checkpoint_path) / "policy" / "weights"
             optimizer_path = Path(last_checkpoint_path) / "policy" / "optimizer"
         else:
             weights_path = None
             optimizer_path = None
-        
+
         self.use_hf_checkpoint = self.master_config["checkpointing"].get("hf_checkpoint", False)
-        
-        self.policy = self._initialize_policy(
-            self.cluster,
-            policy_config,
-            self.tokenizer,
-            weights_path,
-            optimizer_path
-        )
-        
+
+        self.policy = self._initialize_policy(self.cluster, policy_config, self.tokenizer, weights_path, optimizer_path)
+
         self.loss_fn = NLLLoss()
 
     def _setup_dataloaders(
@@ -171,7 +165,7 @@ class SFTTrainer:
         policy_config: PolicyConfig,
         tokenizer: PreTrainedTokenizerBase,
         weights_path: Optional[Path],
-        optimizer_path: Optional[Path]
+        optimizer_path: Optional[Path],
     ) -> Policy:
         use_cce = self.master_config["sft"].get("use_cut_cross_entropy", False)
         if use_cce:
@@ -190,81 +184,36 @@ class SFTTrainer:
 
     async def validate(self, step: int) -> Optional[tuple[dict[str, float], dict[str, float]]]:
         """Run validation on the validation dataset."""
-        if self.val_dataloader is None:
-            logging.info("No validation dataloader provided, skipping validation")
-            return None
-
-        timer = Timer()
         sft_config = self.master_config["sft"]
 
-        with timer.time("total_validation_time"):
-            print(f"▶ Starting validation at step {step}...")
-
-            val_metrics = {"val_loss": 0.0}
-            num_valid_batches = 0
-
-            self.policy.prepare_for_training()
-            for batch_idx, raw_val_batch in enumerate(self.val_dataloader):
-                val_batch = BatchedDataDict(raw_val_batch)
-                
-                val_data = trainer_common.process_supervised_batch(
-                    val_batch,
-                    max_seq_len=self.master_config["policy"]["max_total_sequence_length"],
-                    tokenizer_pad_token_id=self.tokenizer.pad_token_id,
-                )
-
-                val_results = await self.policy.train(
-                    val_data,
-                    self.loss_fn,
-                    eval_mode=True,
-                    gbs=sft_config["val_global_batch_size"],
-                    mbs=sft_config["val_micro_batch_size"],
-                )
-
-                if len(val_results["all_mb_metrics"]) == 0:
-                    warnings.warn(
-                        "No validation metrics were collected for this batch."
-                        " This is likely because there were no valid samples."
-                    )
-                else:
-                    val_metrics["val_loss"] += float(val_results["loss"])
-                    num_valid_batches += 1
-
-                if (
-                    sft_config["val_batches"] > 0
-                    and batch_idx >= sft_config["val_batches"] - 1
-                ):
-                    break
-
-            if num_valid_batches > 0:
-                val_metrics["val_loss"] /= num_valid_batches
-            else:
-                warnings.warn(
-                    "No validation metrics were collected."
-                    " This is likely because there were no valid samples in the validation set."
-                )
-
-            self.policy.prepare_for_training()
-
-        timing_metrics = timer.get_timing_metrics(reduction_op="sum")
-
-        if num_valid_batches > 0:
-            print("\n📊 Validation Results:")
-            print(f"    • Validation loss: {val_metrics['val_loss']:.4f}")
-
-            trainer_common.log_validation_results(
-                val_metrics,
-                timing_metrics,
-                step,
-                self.logger,
-                metric_names=["val_loss"],
+        def process_batch_fn(raw_batch):
+            """Process raw batch into model input."""
+            batch = BatchedDataDict(raw_batch)
+            return trainer_common.process_supervised_batch(
+                batch,
+                max_seq_len=self.master_config["policy"]["max_total_sequence_length"],
+                tokenizer_pad_token_id=self.tokenizer.pad_token_id,
             )
-        else:
-            # Still log timing even if no valid batches
-            self.logger.log_metrics(timing_metrics, step, prefix="timing/validation")
 
-        timer.reset()
-        return val_metrics, timing_metrics
+        def accumulate_metrics_fn(val_metrics, val_results):
+            """Accumulate validation metrics."""
+            val_metrics["val_loss"] += float(val_results["loss"])
+
+        result = await trainer_common.run_validation_loop(
+            val_dataloader=self.val_dataloader,
+            policy=self.policy,
+            loss_fn=self.loss_fn,
+            step=step,
+            logger=self.logger,
+            max_val_batches=sft_config["val_batches"],
+            val_global_batch_size=sft_config["val_global_batch_size"],
+            val_micro_batch_size=sft_config["val_micro_batch_size"],
+            process_batch_fn=process_batch_fn,
+            metric_names=["val_loss"],
+            accumulate_metrics_fn=accumulate_metrics_fn,
+        )
+
+        return result
 
     async def train(self) -> None:
         timer = Timer()
@@ -289,27 +238,20 @@ class SFTTrainer:
             if validation_result is not None:
                 val_metrics, validation_timings = validation_result
                 self.logger.log_metrics(val_metrics, total_steps, prefix="validation")
-                self.logger.log_metrics(
-                    validation_timings, total_steps, prefix="timing/validation"
-                )
+                self.logger.log_metrics(validation_timings, total_steps, prefix="timing/validation")
 
         self.policy.prepare_for_training()
 
-        while (
-            current_epoch < max_num_epochs
-            and total_steps < self.master_config["sft"]["max_num_steps"]
-        ):
-            logging.info(
-                f"\n{'=' * 25} Epoch {current_epoch + 1}/{max_num_epochs} {'=' * 25}"
-            )
+        while current_epoch < max_num_epochs and total_steps < self.master_config["sft"]["max_num_steps"]:
+            logging.info(f"\n{'=' * 25} Epoch {current_epoch + 1}/{max_num_epochs} {'=' * 25}")
 
             for raw_batch in self.train_dataloader:
                 logging.info(
                     f"\n{'=' * 25} Step {current_step + 1}/{min(len(self.train_dataloader), self.master_config['sft']['max_num_steps'])} {'=' * 25}"
                 )
-                
+
                 batch = BatchedDataDict(raw_batch)
-                
+
                 maybe_gpu_profile_step(self.policy, total_steps + 1)
                 val_metrics, validation_timings = None, None
 
@@ -327,11 +269,8 @@ class SFTTrainer:
                     with timer.time("policy_training"):
                         train_results = await self.policy.train(train_data, self.loss_fn)
 
-                    is_last_step = total_steps + 1 >= self.master_config["sft"][
-                        "max_num_steps"
-                    ] or (
-                        current_epoch + 1 == max_num_epochs
-                        and current_step + 1 == len(self.train_dataloader)
+                    is_last_step = total_steps + 1 >= self.master_config["sft"]["max_num_steps"] or (
+                        current_epoch + 1 == max_num_epochs and current_step + 1 == len(self.train_dataloader)
                     )
 
                     if trainer_common.should_validate_now(total_steps + 1, val_period, val_at_start):
@@ -344,13 +283,9 @@ class SFTTrainer:
                                 total_steps + 1,
                                 prefix="timing/validation",
                             )
-                            self.logger.log_metrics(
-                                val_metrics, total_steps + 1, prefix="validation"
-                            )
+                            self.logger.log_metrics(val_metrics, total_steps + 1, prefix="validation")
 
-                    self.sft_save_state["consumed_samples"] += self.master_config[
-                        "policy"
-                    ]["train_global_batch_size"]
+                    self.sft_save_state["consumed_samples"] += self.master_config["policy"]["train_global_batch_size"]
                     timeout.mark_iteration()
                     should_save_by_step, should_save_by_timeout = trainer_common.should_checkpoint(
                         total_steps + 1,
@@ -396,7 +331,7 @@ class SFTTrainer:
 
             current_epoch += 1
             current_step = 0
-    
+
     def _log_step(
         self,
         metrics: dict[str, Any],
@@ -410,18 +345,16 @@ class SFTTrainer:
         timing_metrics = timer.get_timing_metrics(reduction_op="sum")
 
         if "total_flops" in train_results:
-            tflops_metrics = trainer_common.calculate_and_log_tflops(
-                train_results, timing_metrics
-            )
+            tflops_metrics = trainer_common.calculate_and_log_tflops(train_results, timing_metrics)
             if tflops_metrics:
                 metrics.update(tflops_metrics)
 
             total_valid_toks = train_results["all_mb_metrics"]["global_valid_toks"][0]
             print(f"  • Total valid tokens: {total_valid_toks}")
-            print(f"  • Mean microbatch tokens: {total_valid_toks / len(train_results['all_mb_metrics']['global_valid_toks']):.0f}")
+            print(
+                f"  • Mean microbatch tokens: {total_valid_toks / len(train_results['all_mb_metrics']['global_valid_toks']):.0f}"
+            )
             print(f"  • Estimated throughput: {total_valid_toks / timing_metrics['policy_training']:.2f} tok/s")
 
         self.logger.log_metrics(metrics, total_steps + 1, prefix="train")
-        trainer_common.log_timing_metrics(
-            timing_metrics, total_steps + 1, self.logger, prefix="timing/train"
-        )
+        trainer_common.log_timing_metrics(timing_metrics, total_steps + 1, self.logger, prefix="timing/train")

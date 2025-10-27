@@ -40,10 +40,6 @@ from rlkit.data.datasets import (
     preference_collate_fn,
 )
 from rlkit.data.interfaces import TaskDataSpec
-from rlkit.data.llm_message_utils import (
-    add_loss_mask_to_message_log,
-    batched_message_log_to_flat_message,
-)
 from rlkit.distributed.batched_data_dict import BatchedDataDict
 from rlkit.distributed.virtual_cluster import RayVirtualCluster
 from rlkit.models.policy.interfaces import PolicyInterface
@@ -160,12 +156,8 @@ def setup(
         cluster=cluster,
         config=policy_config,
         tokenizer=tokenizer,
-        weights_path=Path(last_checkpoint_path) / "policy" / "weights"
-        if last_checkpoint_path
-        else None,
-        optimizer_path=Path(last_checkpoint_path) / "policy" / "optimizer"
-        if last_checkpoint_path
-        else None,
+        weights_path=Path(last_checkpoint_path) / "policy" / "weights" if last_checkpoint_path else None,
+        optimizer_path=Path(last_checkpoint_path) / "policy" / "optimizer" if last_checkpoint_path else None,
         init_optimizer=True,
         init_reference_model=False,
     )
@@ -192,7 +184,7 @@ def setup(
 # =======================================================
 # Training & Validation
 # =======================================================
-def validate(
+async def validate(
     policy: PolicyInterface,
     val_dataloader: StatefulDataLoader,
     tokenizer,
@@ -203,166 +195,71 @@ def validate(
     val_batches: int,
     val_batch_size: int,
     val_mbs: int,
+    logger,
 ):
     """Run validation on the validation dataset."""
-    if val_dataloader is None:
-        print("  ⚠️ No validation dataloader provided, skipping validation")
-        return
 
-    timer = Timer()
-
-    with timer.time("total_validation_time"):
-        print(f"▶ Starting validation at step {step}...")
-
-        # Show a progress indicator for validation
-        # val_total = len(val_dataloader)
-
-        list_of_val_metrics = []
-
-        num_valid_batches = 0
-
-        policy.prepare_for_training()
-        for batch_idx, val_batch in enumerate(val_dataloader):
-            ## add loss mask based on role to every message
-            add_loss_mask_to_message_log(
-                val_batch["message_log"],
-                roles_to_train_on=["assistant"],
-            )
-
-            cat_and_padded, input_lengths = batched_message_log_to_flat_message(
-                val_batch["message_log"],
-                pad_value_dict={"token_ids": tokenizer.pad_token_id},
-                make_sequence_length_divisible_by=master_config["policy"][
-                    "make_sequence_length_divisible_by"
-                ],
-            )
-
-            val_data: BatchedDataDict = BatchedDataDict(
-                {
-                    "input_ids": cat_and_padded["token_ids"],
-                    "input_lengths": input_lengths,
-                    "token_mask": cat_and_padded["token_loss_mask"],
-                    "sample_mask": val_batch["loss_multiplier"],
-                }
-            )
-
-            ## just run model fwd
-            val_results = policy.train(
-                val_data,
-                loss_fn,
-                eval_mode=True,
-                ## NOTE: we double the batch size here because each preference example corresponds to a pair of
-                ## examples, chosen and rejected, and the pair needs to be processed as part of the same microbatch.
-                gbs=val_batch_size * 2,
-                mbs=val_mbs * 2,
-            )
-
-            if len(val_results["all_mb_metrics"]) == 0:
-                warnings.warn(
-                    "No validation metrics were collected for this batch."
-                    " This is likely because there were no valid samples."
-                )
-            else:
-                list_of_val_metrics.append(
-                    RMValMetrics(
-                        val_loss=sum(val_results["all_mb_metrics"]["loss"]),
-                        accuracy=sum(val_results["all_mb_metrics"]["accuracy"]),
-                        rewards_chosen_mean=sum(
-                            val_results["all_mb_metrics"]["rewards_chosen_mean"]
-                        ),
-                        rewards_rejected_mean=sum(
-                            val_results["all_mb_metrics"]["rewards_rejected_mean"]
-                        ),
-                        num_valid_samples=sum(
-                            val_results["all_mb_metrics"]["num_valid_samples"]
-                        ),
-                    )
-                )
-
-                num_valid_batches += 1
-
-            if val_batches > 0 and batch_idx >= val_batches - 1:
-                break
-
-        if num_valid_batches > 0:
-            sum_num_valid_samples = sum(
-                [m["num_valid_samples"] for m in list_of_val_metrics]
-            )
-            val_metrics = RMValMetrics(
-                val_loss=sum(
-                    [
-                        m["val_loss"] * m["num_valid_samples"]
-                        for m in list_of_val_metrics
-                    ]
-                )
-                / sum_num_valid_samples,
-                accuracy=sum(
-                    [
-                        m["accuracy"] * m["num_valid_samples"]
-                        for m in list_of_val_metrics
-                    ]
-                )
-                / sum_num_valid_samples,
-                rewards_chosen_mean=sum(
-                    [
-                        m["rewards_chosen_mean"] * m["num_valid_samples"]
-                        for m in list_of_val_metrics
-                    ]
-                )
-                / sum_num_valid_samples,
-                rewards_rejected_mean=sum(
-                    [
-                        m["rewards_rejected_mean"] * m["num_valid_samples"]
-                        for m in list_of_val_metrics
-                    ]
-                )
-                / sum_num_valid_samples,
-                num_valid_samples=sum_num_valid_samples,
-            )
-        else:
-            warnings.warn(
-                "No validation metrics were collected."
-                " This is likely because there were no valid samples in the validation set."
-            )
-            val_metrics = RMValMetrics(
-                val_loss=0.0,
-                accuracy=0.0,
-                rewards_chosen_mean=0.0,
-                rewards_rejected_mean=0.0,
-                num_valid_samples=0.0,
-            )
-
-        # Calculate validation metrics
-        policy.prepare_for_training()
-
-    # Get timing metrics
-    timing_metrics = timer.get_timing_metrics(reduction_op="sum")
-
-    if num_valid_batches > 0:
-        trainer_common.log_validation_results(
-            val_metrics,
-            timing_metrics,
-            step,
-            logger,
-            metric_names=[
-                "val_loss",
-                "accuracy",
-                "rewards_chosen_mean",
-                "rewards_rejected_mean",
-                "num_valid_samples",
-            ],
+    def process_batch_fn(raw_batch):
+        """Process raw batch into model input."""
+        return trainer_common.process_preference_batch(
+            raw_batch,
+            tokenizer=tokenizer,
+            max_seq_len=master_config["policy"]["make_sequence_length_divisible_by"],
+            roles_to_train_on=["assistant"],
         )
-    else:
-        # Still log timing even if no valid batches
-        logger.log_metrics(timing_metrics, step, prefix="timing/validation")
 
-    # Make sure to reset the timer after validation
-    timer.reset()
+    # Track sample counts for weighted averaging
+    sample_counts = []
+
+    def accumulate_metrics_fn(val_metrics, val_results):
+        """Accumulate validation metrics with sample-weighted averaging."""
+        # Sum metrics across microbatches
+        num_valid_samples = sum(val_results["all_mb_metrics"]["num_valid_samples"])
+        sample_counts.append(num_valid_samples)
+
+        val_metrics["val_loss"] += sum(val_results["all_mb_metrics"]["loss"]) * num_valid_samples
+        val_metrics["accuracy"] += sum(val_results["all_mb_metrics"]["accuracy"]) * num_valid_samples
+        val_metrics["rewards_chosen_mean"] += (
+            sum(val_results["all_mb_metrics"]["rewards_chosen_mean"]) * num_valid_samples
+        )
+        val_metrics["rewards_rejected_mean"] += (
+            sum(val_results["all_mb_metrics"]["rewards_rejected_mean"]) * num_valid_samples
+        )
+        val_metrics["num_valid_samples"] += num_valid_samples
+
+    result = await trainer_common.run_validation_loop(
+        val_dataloader=val_dataloader,
+        policy=policy,
+        loss_fn=loss_fn,
+        step=step,
+        logger=logger,
+        max_val_batches=val_batches,
+        # NOTE: we double the batch size here because each preference example corresponds to a pair of
+        # examples, chosen and rejected, and the pair needs to be processed as part of the same microbatch.
+        val_global_batch_size=val_batch_size * 2,
+        val_micro_batch_size=val_mbs * 2,
+        process_batch_fn=process_batch_fn,
+        metric_names=["val_loss", "accuracy", "rewards_chosen_mean", "rewards_rejected_mean", "num_valid_samples"],
+        accumulate_metrics_fn=accumulate_metrics_fn,
+    )
+
+    if result is None:
+        return None
+
+    val_metrics, timing_metrics = result
+
+    # Perform weighted averaging (divide by total num_valid_samples)
+    total_samples = val_metrics.get("num_valid_samples", 1)
+    if total_samples > 0:
+        val_metrics["val_loss"] /= total_samples
+        val_metrics["accuracy"] /= total_samples
+        val_metrics["rewards_chosen_mean"] /= total_samples
+        val_metrics["rewards_rejected_mean"] /= total_samples
 
     return val_metrics, timing_metrics
 
 
-def rm_train(
+async def rm_train(
     policy,
     train_dataloader,
     val_dataloader,
@@ -401,7 +298,7 @@ def rm_train(
     # Run validation at the start if configured
     if trainer_common.should_validate_now(total_steps, val_period, val_at_start):
         print("\n🔍 Running initial validation...")
-        val_metrics, validation_timings = validate(
+        val_metrics, validation_timings = await validate(
             policy,
             val_dataloader,
             tokenizer,
@@ -412,6 +309,7 @@ def rm_train(
             val_batches=rm_config["val_batches"],
             val_batch_size=rm_config["val_global_batch_size"],
             val_mbs=rm_config["val_micro_batch_size"],
+            logger=logger,
         )
 
         logger.log_metrics(val_metrics, total_steps, prefix="validation")
@@ -420,8 +318,7 @@ def rm_train(
     policy.prepare_for_training()
 
     while current_epoch < max_num_epochs and (
-        master_config["rm"]["max_num_steps"] == -1
-        or total_steps < master_config["rm"]["max_num_steps"]
+        master_config["rm"]["max_num_steps"] == -1 or total_steps < master_config["rm"]["max_num_steps"]
     ):
         print(f"\n{'=' * 25} Epoch {current_epoch + 1}/{max_num_epochs} {'=' * 25}")
 
@@ -436,32 +333,16 @@ def rm_train(
                 # Prepare batch and generate responses
                 print("▶ Preparing batch...")
                 with timer.time("data_processing"):
-                    ## add loss mask based on role to every message
-                    add_loss_mask_to_message_log(
-                        batch["message_log"],
+                    train_data = trainer_common.process_preference_batch(
+                        batch,
+                        tokenizer=tokenizer,
+                        max_seq_len=master_config["policy"]["make_sequence_length_divisible_by"],
                         roles_to_train_on=["assistant"],
-                    )
-
-                    cat_and_padded, input_lengths = batched_message_log_to_flat_message(
-                        batch["message_log"],
-                        pad_value_dict={"token_ids": tokenizer.pad_token_id},
-                        make_sequence_length_divisible_by=master_config["policy"][
-                            "make_sequence_length_divisible_by"
-                        ],
-                    )
-
-                    train_data: BatchedDataDict = BatchedDataDict(
-                        {
-                            "input_ids": cat_and_padded["token_ids"],
-                            "input_lengths": input_lengths,
-                            "token_mask": cat_and_padded["token_loss_mask"],
-                            "sample_mask": batch["loss_multiplier"],
-                        }
                     )
 
                 print("▶ Taking a training step...")
 
-                train_results = policy.train(
+                train_results = await policy.train(
                     train_data,
                     loss_fn,
                     eval_mode=False,
@@ -474,14 +355,11 @@ def rm_train(
                 is_last_step = (
                     master_config["rm"]["max_num_steps"] != -1
                     and total_steps + 1 >= master_config["rm"]["max_num_steps"]
-                ) or (
-                    current_epoch + 1 == max_num_epochs
-                    and current_step + 1 == len(train_dataloader)
-                )
+                ) or (current_epoch + 1 == max_num_epochs and current_step + 1 == len(train_dataloader))
 
                 # Run validation if it's a validation step
                 if trainer_common.should_validate_now(total_steps + 1, val_period, val_at_start):
-                    val_metrics, validation_timings = validate(
+                    val_metrics, validation_timings = await validate(
                         policy,
                         val_dataloader,
                         tokenizer,
@@ -492,18 +370,13 @@ def rm_train(
                         val_batches=rm_config["val_batches"],
                         val_batch_size=rm_config["val_global_batch_size"],
                         val_mbs=rm_config["val_micro_batch_size"],
+                        logger=logger,
                     )
-                    logger.log_metrics(
-                        validation_timings, total_steps + 1, prefix="timing/validation"
-                    )
-                    logger.log_metrics(
-                        val_metrics, total_steps + 1, prefix="validation"
-                    )
+                    logger.log_metrics(validation_timings, total_steps + 1, prefix="timing/validation")
+                    logger.log_metrics(val_metrics, total_steps + 1, prefix="validation")
 
                 ## Checkpointing
-                rm_save_state["consumed_samples"] += master_config["policy"][
-                    "train_global_batch_size"
-                ]
+                rm_save_state["consumed_samples"] += master_config["policy"]["train_global_batch_size"]
                 timeout.mark_iteration()
                 should_save_by_step, should_save_by_timeout = trainer_common.should_checkpoint(
                     total_steps + 1,
@@ -512,9 +385,7 @@ def rm_train(
                     timeout,
                 )
 
-                if master_config["checkpointing"]["enabled"] and (
-                    should_save_by_step or should_save_by_timeout
-                ):
+                if master_config["checkpointing"]["enabled"] and (should_save_by_step or should_save_by_timeout):
                     trainer_common.update_save_state_for_checkpoint(
                         rm_save_state,
                         step=(current_step + 1) % len(train_dataloader),
@@ -548,27 +419,18 @@ def rm_train(
             print("\n📊 Training Results:")
             print(f"  • Loss: {float(metrics['loss']):.4f}")
             print(f"  • Accuracy: {float(metrics['accuracy']):.4f}")
-            print(
-                f"  • Rewards chosen mean: {float(metrics['rewards_chosen_mean']):.4f}"
-            )
-            print(
-                f"  • Rewards rejected mean: {float(metrics['rewards_rejected_mean']):.4f}"
-            )
+            print(f"  • Rewards chosen mean: {float(metrics['rewards_chosen_mean']):.4f}")
+            print(f"  • Rewards rejected mean: {float(metrics['rewards_rejected_mean']):.4f}")
             print(f"  • Num valid samples: {float(metrics['num_valid_samples']):.0f}")
 
             logger.log_metrics(metrics, total_steps + 1, prefix="train")
-            trainer_common.log_timing_metrics(
-                timing_metrics, total_steps + 1, logger, prefix="timing/train"
-            )
+            trainer_common.log_timing_metrics(timing_metrics, total_steps + 1, logger, prefix="timing/train")
 
             timer.reset()
             current_step += 1
             total_steps += 1
 
-            if (
-                master_config["rm"]["max_num_steps"] != -1
-                and total_steps >= master_config["rm"]["max_num_steps"]
-            ):
+            if master_config["rm"]["max_num_steps"] != -1 and total_steps >= master_config["rm"]["max_num_steps"]:
                 return
 
         current_epoch += 1
