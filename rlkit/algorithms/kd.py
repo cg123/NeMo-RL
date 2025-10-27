@@ -30,6 +30,7 @@ from rlkit.algorithms.loss_functions import (
     KnowledgeDistillationLoss,
 )
 from rlkit.algorithms.utils import set_seed, _pad_tensor
+from rlkit.algorithms import trainer_common
 from rlkit.config import (
     KDConfig,
     KDLoggerConfig,
@@ -132,7 +133,7 @@ class KDTrainer:
 
         # Setup logger
         logging.info("Setting up logger...")
-        self.logger = self._setup_logger(master_config["logger"])
+        self.logger = trainer_common.setup_logger(master_config["logger"], self.master_config)
 
         # Setup checkpointing
         logging.info("Setting up checkpointing...")
@@ -140,7 +141,7 @@ class KDTrainer:
             self.checkpointer,
             self.kd_save_state,
             last_checkpoint_path,
-        ) = self._setup_checkpointing(master_config["checkpointing"])
+        ) = trainer_common.setup_checkpointing(master_config["checkpointing"], _default_kd_save_state)
 
         # Setup dataloaders
         logging.info("Setting up dataloaders...")
@@ -212,26 +213,6 @@ class KDTrainer:
 
         logging.info("  ✓ KD Trainer initialized successfully")
 
-    def _setup_logger(self, logger_config: KDLoggerConfig) -> Logger:
-        """Setup logger and log hyperparameters."""
-        logger = Logger(logger_config)
-        logger.log_hyperparams(self.master_config)
-        return logger
-
-    def _setup_checkpointing(
-        self, checkpoint_config: CheckpointingConfig
-    ) -> tuple[CheckpointManager, KDSaveState, Optional[str]]:
-        """Setup checkpointing and load previous state if resuming."""
-        checkpointer = CheckpointManager(checkpoint_config)
-        last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
-        kd_save_state = cast(
-            Optional[KDSaveState],
-            checkpointer.load_training_info(last_checkpoint_path),
-        )
-        if kd_save_state is None:
-            kd_save_state = _default_kd_save_state()
-        return checkpointer, kd_save_state, last_checkpoint_path
-
     def _setup_dataloaders(
         self,
         train_dataset: Dataset,
@@ -243,27 +224,17 @@ class KDTrainer:
     ) -> tuple[StatefulDataLoader, Optional[StatefulDataLoader]]:
         """Setup train/val dataloaders (reuse SFT pattern)."""
 
-        # Collate function for supervised learning data
-        def collate_fn(batch):
-            return {k: [x[k] for x in batch] for k in batch[0]}
-
         # Calculate batch size from global batch size and micro batch size
         train_batch_size = policy_config["train_global_batch_size"] // policy_config["train_micro_batch_size"]
 
-        train_dataloader = StatefulDataLoader(
+        train_dataloader = trainer_common.setup_dataloader(
             train_dataset,
             batch_size=train_batch_size,
             shuffle=data_config["shuffle"],
+            collate_fn=trainer_common.dict_list_collate_fn,
+            last_checkpoint_path=last_checkpoint_path,
             drop_last=True,
-            collate_fn=collate_fn,
         )
-
-        # Restore dataloader state if resuming
-        if last_checkpoint_path is not None:
-            dataloader_state_path = os.path.join(last_checkpoint_path, "train_dataloader.pt")
-            if os.path.exists(dataloader_state_path):
-                dataloader_state_dict = torch.load(dataloader_state_path)
-                train_dataloader.load_state_dict(dataloader_state_dict)
 
         logging.info(f"  ✓ Training dataloader loaded with {len(train_dataset)} samples")
 
@@ -272,11 +243,13 @@ class KDTrainer:
         if kd_config.get("val_period", 0) > 0 or kd_config.get("val_at_start", False):
             assert val_dataset is not None, "Validation dataset required if validation enabled"
             val_batch_size = kd_config["val_global_batch_size"] // kd_config["val_micro_batch_size"]
-            val_dataloader = StatefulDataLoader(
+            val_dataloader = trainer_common.setup_dataloader(
                 val_dataset,
                 batch_size=val_batch_size,
                 shuffle=False,
-                collate_fn=collate_fn,
+                collate_fn=trainer_common.dict_list_collate_fn,
+                last_checkpoint_path=None,
+                drop_last=False,
             )
             logging.info(f"  ✓ Validation dataloader loaded with {len(val_dataset)} samples")
 
@@ -741,10 +714,12 @@ class KDTrainer:
                     # 5. Checkpointing
                     consumed_samples += self.master_config["student_policy"]["train_global_batch_size"]
                     is_last_step = total_steps + 1 >= max_num_steps
-                    should_save_by_step = (
-                        is_last_step or (total_steps + 1) % self.master_config["checkpointing"]["save_period"] == 0
+                    should_save_by_step, should_save_by_timeout = trainer_common.should_checkpoint(
+                        total_steps + 1,
+                        self.master_config["checkpointing"]["save_period"],
+                        is_last_step,
+                        timeout,
                     )
-                    should_save_by_timeout = timeout.check_save()
 
                     if should_save_by_step or should_save_by_timeout:
                         self._save_checkpoint(

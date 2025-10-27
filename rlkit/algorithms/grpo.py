@@ -34,6 +34,7 @@ from rlkit.algorithms.loss_functions import (
     ClippedPGLossFn,
 )
 from rlkit.algorithms.utils import set_seed, vector_subseq_starts, _pad_tensor
+from rlkit.algorithms import trainer_common
 from rlkit.config import (
     CheckpointingConfig,
     ClippedPGLossConfig,
@@ -130,11 +131,10 @@ class GRPOTrainer:
 
         set_seed(grpo_config["seed"])
 
-        logger = self._setup_logger(logger_config)
+        logger = trainer_common.setup_logger(logger_config, self.master_config)
 
-        checkpointer, grpo_save_state, last_checkpoint_path = self._setup_checkpointing(
-            self.master_config["checkpointing"]
-        )
+        checkpointer, grpo_save_state, last_checkpoint_path = trainer_common.setup_checkpointing(
+            self.master_config["checkpointing"], _default_grpo_save_state)
 
         dataloader, val_dataloader = self._setup_dataloaders(
             dataset,
@@ -213,24 +213,6 @@ class GRPOTrainer:
         self.checkpointer = checkpointer
         self.grpo_save_state = grpo_save_state
 
-    def _setup_logger(self, logger_config: GRPOLoggerConfig) -> Logger:
-        logger = Logger(logger_config)
-        logger.log_hyperparams(self.master_config)
-        return logger
-
-    def _setup_checkpointing(
-        self, checkpoint_config: CheckpointingConfig
-    ) -> tuple[CheckpointManager, GRPOSaveState, Optional[str]]:
-        checkpointer = CheckpointManager(checkpoint_config)
-        last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
-        grpo_save_state = cast(
-            Optional[GRPOSaveState],
-            checkpointer.load_training_info(last_checkpoint_path),
-        )
-        if grpo_save_state is None:
-            grpo_save_state = _default_grpo_save_state()
-        return checkpointer, grpo_save_state, last_checkpoint_path
-
     def _setup_dataloaders(
         self,
         dataset: Dataset,
@@ -239,21 +221,14 @@ class GRPOTrainer:
         grpo_config: GRPOConfig,
         last_checkpoint_path: Optional[str],
     ) -> tuple[StatefulDataLoader, Optional[StatefulDataLoader]]:
-        rl_collate_fn = lambda batch: {k: [x[k] for x in batch] for k in batch[0]}
-        
-        dataloader = StatefulDataLoader(
+        dataloader = trainer_common.setup_dataloader(
             dataset,
             batch_size=grpo_config["num_prompts_per_step"],
             shuffle=data_config["shuffle"],
+            collate_fn=trainer_common.dict_list_collate_fn,
+            last_checkpoint_path=last_checkpoint_path,
             drop_last=True,
-            collate_fn=rl_collate_fn,
         )
-        if last_checkpoint_path is not None:
-            dataloader_state_dict = torch.load(
-                os.path.join(last_checkpoint_path, "train_dataloader.pt")
-            )
-            dataloader.load_state_dict(dataloader_state_dict)
-
         logging.info(f"  ✓ Training dataloader loaded with {len(dataset)} samples")
 
         val_dataloader: Optional[StatefulDataLoader] = None
@@ -261,11 +236,13 @@ class GRPOTrainer:
             assert val_dataset is not None, (
                 "Validation dataset is required if validation is enabled"
             )
-            val_dataloader = StatefulDataLoader(
+            val_dataloader = trainer_common.setup_dataloader(
                 val_dataset,
                 batch_size=grpo_config["val_batch_size"],
                 shuffle=False,
-                collate_fn=rl_collate_fn,
+                collate_fn=trainer_common.dict_list_collate_fn,
+                last_checkpoint_path=None,
+                drop_last=False,
             )
             logging.info(
                 f"  ✓ Validation dataloader loaded with {len(val_dataset)} samples"
@@ -558,13 +535,12 @@ class GRPOTrainer:
                 consumed_samples += self.master_config["grpo"]["num_prompts_per_step"]
                 timeout.mark_iteration()
 
-                should_save_by_step = (
-                    is_last_step
-                    or (step + 1)
-                    % self.master_config["checkpointing"]["save_period"]
-                    == 0
+                should_save_by_step, should_save_by_timeout = trainer_common.should_checkpoint(
+                    step + 1,
+                    self.master_config["checkpointing"]["save_period"],
+                    is_last_step,
+                    timeout,
                 )
-                should_save_by_timeout = timeout.check_save()
 
                 self._save_checkpoint(
                     step,
@@ -883,27 +859,16 @@ class GRPOTrainer:
                 )
                 self.master_config["checkpointing"]["metric_name"] = None
 
-        with timer.time("checkpointing"):
-            logging.info(f"Saving checkpoint for step {step + 1}...")
-            checkpoint_path = self.checkpointer.init_tmp_checkpoint(
-                step + 1, self.grpo_save_state, self.master_config
-            )
-            self.policy.save_checkpoint(
-                weights_path=os.path.join(
-                    checkpoint_path, "policy", "weights"
-                ),
-                optimizer_path=os.path.join(
-                    checkpoint_path, "policy", "optimizer"
-                ),
-                tokenizer_path=os.path.join(
-                    checkpoint_path, "policy", "tokenizer"
-                ),
-            )
-            torch.save(
-                self.dataloader.state_dict(),
-                os.path.join(checkpoint_path, "train_dataloader.pt"),
-            )
-            self.checkpointer.finalize_checkpoint(checkpoint_path)
+        trainer_common.save_training_checkpoint(
+            self.checkpointer,
+            self.policy,
+            self.dataloader,
+            self.grpo_save_state,
+            self.master_config,
+            step + 1,
+            policy_subdir="policy",
+            timer=timer,
+        )
 
     def _log_training_step(
         self,

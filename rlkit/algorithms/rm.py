@@ -25,6 +25,7 @@ from rlkit.algorithms.loss_functions import (
     PreferenceLoss,
 )
 from rlkit.algorithms.utils import set_seed
+from rlkit.algorithms import trainer_common
 from rlkit.config import (
     ClusterConfig,
     CheckpointingConfig,
@@ -114,40 +115,33 @@ def setup(
     # ==========================
     #         Logger
     # ==========================
-    logger = Logger(logger_config)
-    logger.log_hyperparams(master_config)
+    logger = trainer_common.setup_logger(logger_config, master_config)
 
     # ==========================
     #      Checkpointing
     # ==========================
-    checkpointer = CheckpointManager(master_config["checkpointing"])
-    last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
-    rm_save_state: Optional[RMSaveState] = checkpointer.load_training_info(
-        last_checkpoint_path
+    checkpointer, rm_save_state, last_checkpoint_path = trainer_common.setup_checkpointing(
+        master_config["checkpointing"], _default_rm_save_state
     )
 
     # ==========================
     #           Data
     # ==========================
-    train_dataloader = StatefulDataLoader(
+    train_dataloader = trainer_common.setup_dataloader(
         train_dataset,
         batch_size=policy_config["train_global_batch_size"],
         shuffle=data_config["shuffle"],
         collate_fn=preference_collate_fn,
+        last_checkpoint_path=last_checkpoint_path,
         drop_last=True,
     )
 
-    if last_checkpoint_path is not None:
-        dataloader_state_dict = torch.load(
-            os.path.join(last_checkpoint_path, "train_dataloader.pt")
-        )
-        train_dataloader.load_state_dict(dataloader_state_dict)
-
-    val_dataloader = StatefulDataLoader(
+    val_dataloader = trainer_common.setup_dataloader(
         val_dataset,
         batch_size=rm_config["val_global_batch_size"],
         shuffle=False,
         collate_fn=preference_collate_fn,
+        last_checkpoint_path=None,
         drop_last=True,
     )
 
@@ -155,15 +149,7 @@ def setup(
     #          Cluster
     # ==========================
     print("\n▶ Setting up compute cluster...")
-    cluster = RayVirtualCluster(
-        name="rm_cluster",
-        bundle_ct_per_node_list=[cluster_config["gpus_per_node"]]
-        * cluster_config["num_nodes"],
-        use_gpus=True,
-        num_gpus_per_node=cluster_config["gpus_per_node"],
-        max_colocated_worker_groups=1,
-    )
-    print(f"  ✓ Ray cluster initialized with {cluster_config['num_nodes']} nodes")
+    cluster = trainer_common.create_cluster("rm_cluster", cluster_config)
 
     # ==========================
     #   Training
@@ -540,28 +526,16 @@ def rm_train(
                             )
                             master_config["checkpointing"]["metric_name"] = None
 
-                    with timer.time("checkpointing"):
-                        print(f"Saving checkpoint for step {total_steps + 1}...")
-                        checkpoint_path = checkpointer.init_tmp_checkpoint(
-                            total_steps + 1, rm_save_state, master_config
-                        )
-
-                        policy.save_checkpoint(
-                            weights_path=os.path.join(
-                                checkpoint_path, "policy", "weights"
-                            ),
-                            optimizer_path=os.path.join(
-                                checkpoint_path, "policy", "optimizer"
-                            ),
-                            tokenizer_path=os.path.join(
-                                checkpoint_path, "policy", "tokenizer"
-                            ),
-                        )
-                        torch.save(
-                            train_dataloader.state_dict(),
-                            os.path.join(checkpoint_path, "train_dataloader.pt"),
-                        )
-                        checkpointer.finalize_checkpoint(checkpoint_path)
+                    trainer_common.save_training_checkpoint(
+                        checkpointer,
+                        policy,
+                        train_dataloader,
+                        rm_save_state,
+                        master_config,
+                        total_steps + 1,
+                        policy_subdir="policy",
+                        timer=timer,
+                    )
 
             losses = train_results["loss"]
             metrics = {
@@ -569,11 +543,7 @@ def rm_train(
                 "grad_norm": train_results["grad_norm"].numpy(),
             }
             metrics.update(train_results["all_mb_metrics"])
-            for k, v in metrics.items():
-                if k in {"lr", "wd", "global_valid_seqs", "global_valid_toks"}:
-                    metrics[k] = np.mean(v).item()
-                else:
-                    metrics[k] = np.sum(v).item()
+            metrics = trainer_common.aggregate_training_metrics(metrics)
             timing_metrics = timer.get_timing_metrics(reduction_op="sum")
 
             print("\n📊 Training Results:")

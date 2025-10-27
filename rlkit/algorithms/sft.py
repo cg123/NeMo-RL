@@ -27,6 +27,7 @@ from rlkit.algorithms.loss_functions import (
     NLLLoss,
 )
 from rlkit.algorithms.utils import set_seed, _pad_tensor
+from rlkit.algorithms import trainer_common
 from rlkit.config import (
     ClusterConfig,
     CheckpointingConfig,
@@ -87,13 +88,13 @@ class SFTTrainer:
 
         set_seed(master_config["sft"]["seed"])
 
-        self.logger = self._setup_logger(master_config["logger"])
+        self.logger = trainer_common.setup_logger(master_config["logger"], self.master_config)
         
         (
             self.checkpointer,
             self.sft_save_state,
             last_checkpoint_path,
-        ) = self._setup_checkpointing(master_config["checkpointing"])
+        ) = trainer_common.setup_checkpointing(master_config["checkpointing"], _default_sft_save_state)
 
         (
             self.train_dataloader,
@@ -130,24 +131,6 @@ class SFTTrainer:
         
         self.loss_fn = NLLLoss()
 
-    def _setup_logger(self, logger_config: LoggerConfig) -> Logger:
-        logger = Logger(logger_config)
-        logger.log_hyperparams(self.master_config)
-        return logger
-
-    def _setup_checkpointing(
-        self, checkpoint_config: CheckpointingConfig
-    ) -> tuple[CheckpointManager, SFTSaveState, Optional[str]]:
-        checkpointer = CheckpointManager(checkpoint_config)
-        last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
-        sft_save_state = cast(
-            Optional[SFTSaveState],
-            checkpointer.load_training_info(last_checkpoint_path),
-        )
-        if sft_save_state is None:
-            sft_save_state = _default_sft_save_state()
-        return checkpointer, sft_save_state, last_checkpoint_path
-
     def _setup_dataloaders(
         self,
         train_dataset: Dataset,
@@ -160,43 +143,31 @@ class SFTTrainer:
         StatefulDataLoader,
         Optional[StatefulDataLoader],
     ]:
-        sft_collate_fn = lambda batch: {k: [x[k] for x in batch] for k in batch[0]}
-        train_dataloader = StatefulDataLoader(
+        train_dataloader = trainer_common.setup_dataloader(
             train_dataset,
             batch_size=policy_config["train_global_batch_size"],
             shuffle=data_config["shuffle"],
-            collate_fn=sft_collate_fn,
+            collate_fn=trainer_common.dict_list_collate_fn,
+            last_checkpoint_path=last_checkpoint_path,
             drop_last=True,
         )
 
-        if last_checkpoint_path is not None:
-            dataloader_state_dict = torch.load(
-                os.path.join(last_checkpoint_path, "train_dataloader.pt")
-            )
-            train_dataloader.load_state_dict(dataloader_state_dict)
-
         val_dataloader: Optional[StatefulDataLoader] = None
         if val_dataset is not None:
-            val_dataloader = StatefulDataLoader(
+            val_dataloader = trainer_common.setup_dataloader(
                 val_dataset,
                 batch_size=sft_config["val_global_batch_size"],
                 shuffle=False,
-                collate_fn=sft_collate_fn
+                collate_fn=trainer_common.dict_list_collate_fn,
+                last_checkpoint_path=None,
+                drop_last=False,
             )
 
         return train_dataloader, val_dataloader
 
     def _setup_cluster(self, cluster_config: ClusterConfig) -> RayVirtualCluster:
         logging.info("Setting up compute cluster...")
-        cluster = RayVirtualCluster(
-            name="grpo_train_cluster",
-            bundle_ct_per_node_list=[cluster_config["gpus_per_node"]] * cluster_config["num_nodes"],
-            use_gpus=True,
-            num_gpus_per_node=cluster_config["gpus_per_node"],
-            max_colocated_worker_groups=1,
-        )
-        logging.info(f"Ray cluster initialized with {cluster_config['num_nodes']} nodes")
-        return cluster
+        return trainer_common.create_cluster("sft_train_cluster", cluster_config)
 
     def _initialize_policy(
         self,
@@ -416,13 +387,12 @@ class SFTTrainer:
                         "policy"
                     ]["train_global_batch_size"]
                     timeout.mark_iteration()
-                    should_save_by_step = (
-                        is_last_step
-                        or (total_steps + 1)
-                        % self.master_config["checkpointing"]["save_period"]
-                        == 0
+                    should_save_by_step, should_save_by_timeout = trainer_common.should_checkpoint(
+                        total_steps + 1,
+                        self.master_config["checkpointing"]["save_period"],
+                        is_last_step,
+                        timeout,
                     )
-                    should_save_by_timeout = timeout.check_save()
 
                     if self.master_config["checkpointing"]["enabled"] and (
                         should_save_by_step or should_save_by_timeout
@@ -453,41 +423,23 @@ class SFTTrainer:
                                     None
                                 )
 
-                        with timer.time("checkpointing"):
-                            logging.info(f"Saving checkpoint for step {total_steps + 1}...")
-                            checkpoint_path = self.checkpointer.init_tmp_checkpoint(
-                                total_steps + 1, self.sft_save_state, self.master_config
-                            )
-                            
-                            self.policy.save_checkpoint(
-                                weights_path=os.path.join(
-                                    checkpoint_path, "policy", "weights"
-                                ),
-                                optimizer_path=os.path.join(
-                                    checkpoint_path, "policy", "optimizer"
-                                ),
-                                tokenizer_path=os.path.join(
-                                    checkpoint_path, "policy", "tokenizer"
-                                ),
-                            )
-                            torch.save(
-                                self.train_dataloader.state_dict(),
-                                os.path.join(
-                                    checkpoint_path, "train_dataloader.pt"
-                                ),
-                            )
-                            self.checkpointer.finalize_checkpoint(checkpoint_path)
+                        trainer_common.save_training_checkpoint(
+                            self.checkpointer,
+                            self.policy,
+                            self.train_dataloader,
+                            self.sft_save_state,
+                            self.master_config,
+                            total_steps + 1,
+                            policy_subdir="policy",
+                            timer=timer,
+                        )
 
                 metrics = {
                     "loss": self._to_scalar_array(train_results["loss"]),
                     "grad_norm": self._to_scalar_array(train_results["grad_norm"]),
                 }
                 metrics.update(train_results["all_mb_metrics"])
-                for k, v in metrics.items():
-                    if k in {"lr", "wd", "global_valid_seqs", "global_valid_toks"}:
-                        metrics[k] = np.mean(v).item()
-                    else:
-                        metrics[k] = np.sum(v).item()
+                metrics = trainer_common.aggregate_training_metrics(metrics)
                 
                 self._log_step(metrics, timer, train_results, total_steps)
 
