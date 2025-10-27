@@ -14,7 +14,7 @@
 import os
 import warnings
 from pathlib import Path
-from typing import Optional, TypedDict
+from typing import Optional, TypedDict, cast
 
 import numpy as np
 import torch
@@ -336,27 +336,24 @@ def validate(
 
     # Get timing metrics
     timing_metrics = timer.get_timing_metrics(reduction_op="sum")
-    validation_time = timing_metrics.get("total_validation_time", 0)
 
     if num_valid_batches > 0:
-        # Print summary of validation results
-        print("\n📊 Validation Results:")
-        print(f"    • Validation loss: {val_metrics['val_loss']:.4f}")
-        print(f"    • Validation accuracy: {val_metrics['accuracy']:.4f}")
-        print(
-            f"    • Validation rewards chosen mean: {val_metrics['rewards_chosen_mean']:.4f}"
+        trainer_common.log_validation_results(
+            val_metrics,
+            timing_metrics,
+            step,
+            logger,
+            metric_names=[
+                "val_loss",
+                "accuracy",
+                "rewards_chosen_mean",
+                "rewards_rejected_mean",
+                "num_valid_samples",
+            ],
         )
-        print(
-            f"    • Validation rewards rejected mean: {val_metrics['rewards_rejected_mean']:.4f}"
-        )
-        print(
-            f"    • Validation num valid samples: {val_metrics['num_valid_samples']:.0f}"
-        )
-
-        # Print timing information
-        print("\n  ⏱️  Validation Timing:")
-        validation_time = timing_metrics.get("total_validation_time", 0)
-        print(f"    • Total validation time: {validation_time:.2f}s")
+    else:
+        # Still log timing even if no valid batches
+        logger.log_metrics(timing_metrics, step, prefix="timing/validation")
 
     # Make sure to reset the timer after validation
     timer.reset()
@@ -396,7 +393,7 @@ def rm_train(
     max_num_epochs = rm_config["max_num_epochs"]
 
     # Run validation at the start if configured
-    if val_at_start and total_steps == 0:
+    if trainer_common.should_validate_now(total_steps, val_period, val_at_start):
         print("\n🔍 Running initial validation...")
         val_metrics, validation_timings = validate(
             policy,
@@ -477,7 +474,7 @@ def rm_train(
                 )
 
                 # Run validation if it's a validation step
-                if val_period > 0 and (total_steps + 1) % val_period == 0:
+                if trainer_common.should_validate_now(total_steps + 1, val_period, val_at_start):
                     val_metrics, validation_timings = validate(
                         policy,
                         val_dataloader,

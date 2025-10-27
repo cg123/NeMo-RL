@@ -635,12 +635,18 @@ class KDTrainer:
             logging.info(f"    • Base loss: {val_metrics['val_base_loss']:.4f}")
             logging.info(f"    • KD loss: {val_metrics['val_kd_loss']:.4f}")
 
-            logging.info("\n  ⏱️  Validation Timing:")
-            validation_time = timing_metrics.get("total_validation_time", 0)
-            logging.info(f"    • Total validation time: {validation_time:.2f}s")
+            trainer_common.log_validation_results(
+                val_metrics,
+                timing_metrics,
+                step,
+                self.logger,
+                metric_names=["val_loss", "val_base_loss", "val_kd_loss"],
+            )
+        else:
+            # Still log timing even if no valid batches
+            self.logger.log_metrics(timing_metrics, step, prefix="timing/validation")
 
         timer.reset()
-
         return val_metrics, timing_metrics
 
     async def train(self) -> None:
@@ -664,7 +670,7 @@ class KDTrainer:
         val_at_start = kd_config.get("val_at_start", False)
 
         # Initial validation
-        if val_at_start and total_steps == 0:
+        if trainer_common.should_validate_now(total_steps, val_period, val_at_start):
             logging.info("\n🔍 Running initial validation...")
             val_result = await self.validate(step=0)
             if val_result:
@@ -704,7 +710,7 @@ class KDTrainer:
 
                     # 4. Validation
                     val_metrics, val_timings = None, None
-                    if val_period > 0 and (total_steps + 1) % val_period == 0:
+                    if trainer_common.should_validate_now(total_steps + 1, val_period, val_at_start):
                         val_result = await self.validate(total_steps + 1)
                         if val_result:
                             val_metrics, val_timings = val_result
@@ -762,25 +768,15 @@ class KDTrainer:
 
         self.student_policy.prepare_for_training()
 
-        # Update save state
-        self.kd_save_state["step"] = step
-        self.kd_save_state["total_steps"] = total_steps
-        self.kd_save_state["epoch"] = epoch
-        if val_metrics is not None:
-            self.kd_save_state["val_loss"] = val_metrics["val_loss"]
-        elif "val_loss" in self.kd_save_state:
-            del self.kd_save_state["val_loss"]
-        self.kd_save_state["consumed_samples"] = consumed_samples
-
-        # Check if metric-based checkpointing is configured
-        if self.master_config["checkpointing"]["metric_name"] is not None:
-            metric_name = self.master_config["checkpointing"]["metric_name"]
-            if metric_name not in self.kd_save_state:
-                warnings.warn(
-                    f"You asked to save checkpoints based on {metric_name} but the metric "
-                    "is not found in the save state. Saving most recent k checkpoints instead."
-                )
-                self.master_config["checkpointing"]["metric_name"] = None
+        trainer_common.update_save_state_for_checkpoint(
+            self.kd_save_state,
+            step=step,
+            consumed_samples=consumed_samples,
+            val_metrics=val_metrics,
+            master_config=self.master_config,
+            epoch=epoch,
+            total_steps=total_steps,
+        )
 
         with timer.time("checkpointing"):
             logging.info(f"Saving checkpoint for step {total_steps}...")
@@ -813,50 +809,14 @@ class KDTrainer:
             self.checkpointer.finalize_checkpoint(checkpoint_path)
             logging.info(f"  ✓ Checkpoint saved to {checkpoint_path}")
 
-    def _log_timing_metrics(self, timing_metrics: dict, step: int) -> None:
-        """Log timing metrics to console and tracking systems."""
-        total_time = timing_metrics.get("total_step_time", 0)
-
-        logging.info("\n  ⏱️  Timing:")
-        logging.info(f"  • Total step time: {total_time:.2f}s")
-
-        for k, v in sorted(timing_metrics.items(), key=lambda item: item[1], reverse=True):
-            if k != "total_step_time":
-                percent = (v / total_time * 100) if total_time > 0 else 0
-                logging.info(f"  • {k}: {v:.2f}s ({percent:.1f}%)")
-
-        # Log to tracking systems
-        self.logger.log_metrics(timing_metrics, step, prefix="timing/train")
-
     def _log_training_step(self, step: int, train_results: dict, timer: Timer) -> None:
         """Log training metrics."""
-        # Extract metrics from training results
-        metrics = {
-            "loss": train_results["loss"].item() if torch.is_tensor(train_results["loss"]) else train_results["loss"],
-            "grad_norm": (
-                train_results["grad_norm"].item()
-                if torch.is_tensor(train_results["grad_norm"])
-                else train_results["grad_norm"]
-            ),
-        }
+        # Prepare metrics (KD has special mean keys for alpha and temperature)
+        mean_keys = {"lr", "wd", "global_valid_seqs", "global_valid_toks", "alpha", "temperature"}
+        metrics = trainer_common.prepare_training_metrics(
+            train_results, mean_keys=mean_keys
+        )
 
-        # Add microbatch metrics
-        if "all_mb_metrics" in train_results:
-            mb_metrics = train_results["all_mb_metrics"]
-            if len(mb_metrics) > 0:
-                # Aggregate metrics across microbatches
-                for key in [
-                    "base_loss",
-                    "kd_loss",
-                    "total_loss",
-                    "alpha",
-                    "temperature",
-                ]:
-                    values = [mb.get(key, 0.0) for mb in mb_metrics if key in mb]
-                    if values:
-                        metrics[key] = np.mean(values).item()
-
-        # Get timing metrics
         timing_metrics = timer.get_timing_metrics(reduction_op="sum")
 
         # Print to console
@@ -872,8 +832,6 @@ class KDTrainer:
             logging.info(f"  • Temperature: {metrics['temperature']:.2f}")
         logging.info(f"  • Grad Norm: {metrics['grad_norm']:.4f}")
 
-        # Log timing metrics using utility method
-        self._log_timing_metrics(timing_metrics, step)
-
         # Log metrics to tracking systems
         self.logger.log_metrics(metrics, step, prefix="train")
+        trainer_common.log_timing_metrics(timing_metrics, step, self.logger)

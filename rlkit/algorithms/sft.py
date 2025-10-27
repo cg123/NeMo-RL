@@ -15,7 +15,7 @@ import logging
 import os
 import warnings
 from pathlib import Path
-from typing import Any, Callable, NotRequired, Optional, TypedDict, cast
+from typing import Any, Callable, Optional, TypedDict, cast
 
 from datasets import Dataset
 import numpy as np
@@ -55,7 +55,7 @@ class SFTSaveState(TypedDict):
     epoch: int  # Track current epoch
     step: int  # Track step within current epoch
     total_steps: int  # Track total number of steps across all epochs
-    val_loss: NotRequired[float]  # Optional field - may not be present during training
+    val_loss: float  # Optional field - may not be present during training
     consumed_samples: int
 
 
@@ -180,13 +180,12 @@ class SFTTrainer:
         use_cce = self.master_config["sft"].get("use_cut_cross_entropy", False)
         if use_cce:
             logging.info("Using cut cross-entropy loss kernel")
-        
-        return Policy(
+
+        return trainer_common.initialize_policy(
             cluster=train_cluster,
-            config=policy_config,
+            policy_config=policy_config,
             tokenizer=tokenizer,
-            weights_path=weights_path,
-            optimizer_path=optimizer_path,
+            last_checkpoint_path=str(weights_path.parent.parent) if weights_path else None,
             init_optimizer=True,
             init_reference_model=False,
             use_hf_checkpoint=self.use_hf_checkpoint,
@@ -298,12 +297,18 @@ class SFTTrainer:
             print("\n📊 Validation Results:")
             print(f"    • Validation loss: {val_metrics['val_loss']:.4f}")
 
-            print("\n  ⏱️  Validation Timing:")
-            validation_time = timing_metrics.get("total_validation_time", 0)
-            print(f"    • Total validation time: {validation_time:.2f}s")
+            trainer_common.log_validation_results(
+                val_metrics,
+                timing_metrics,
+                step,
+                self.logger,
+                metric_names=["val_loss"],
+            )
+        else:
+            # Still log timing even if no valid batches
+            self.logger.log_metrics(timing_metrics, step, prefix="timing/validation")
 
         timer.reset()
-
         return val_metrics, timing_metrics
 
     async def train(self) -> None:
@@ -323,7 +328,7 @@ class SFTTrainer:
         val_at_start = sft_config["val_at_start"]
         max_num_epochs = sft_config["max_num_epochs"]
 
-        if val_at_start and total_steps == 0:
+        if trainer_common.should_validate_now(total_steps, val_period, val_at_start):
             print("\n🔍 Running initial validation...")
             validation_result = await self.validate(step=0)
             if validation_result is not None:
@@ -369,7 +374,7 @@ class SFTTrainer:
                         and current_step + 1 == len(self.train_dataloader)
                     )
 
-                    if val_period > 0 and (total_steps + 1) % val_period == 0:
+                    if trainer_common.should_validate_now(total_steps + 1, val_period, val_at_start):
                         logging.info("Running validation...")
                         validation_result = await self.validate(step=total_steps + 1)
                         if validation_result is not None:
@@ -397,31 +402,15 @@ class SFTTrainer:
                     if self.master_config["checkpointing"]["enabled"] and (
                         should_save_by_step or should_save_by_timeout
                     ):
-                        self.sft_save_state["step"] = (
-                            current_step + 1
-                        ) % len(self.train_dataloader)
-                        self.sft_save_state["total_steps"] = total_steps + 1
-                        self.sft_save_state["epoch"] = current_epoch
-                        if val_metrics is not None:
-                            self.sft_save_state["val_loss"] = val_metrics["val_loss"]
-                        elif "val_loss" in self.sft_save_state:
-                            del self.sft_save_state["val_loss"]
-
-                        if (
-                            self.master_config["checkpointing"]["metric_name"]
-                            is not None
-                        ):
-                            if (
-                                self.master_config["checkpointing"]["metric_name"]
-                                not in self.sft_save_state
-                            ):
-                                warnings.warn(
-                                    f"You asked to save checkpoints based on {self.master_config['checkpointing']['metric_name']} but the metric is not found in the save state. "
-                                    "Saving most recent k checkpoints instead."
-                                )
-                                self.master_config["checkpointing"]["metric_name"] = (
-                                    None
-                                )
+                        trainer_common.update_save_state_for_checkpoint(
+                            self.sft_save_state,
+                            step=(current_step + 1) % len(self.train_dataloader),
+                            consumed_samples=self.sft_save_state["consumed_samples"],
+                            val_metrics=val_metrics,
+                            master_config=self.master_config,
+                            epoch=current_epoch,
+                            total_steps=total_steps + 1,
+                        )
 
                         trainer_common.save_training_checkpoint(
                             self.checkpointer,
@@ -434,13 +423,8 @@ class SFTTrainer:
                             timer=timer,
                         )
 
-                metrics = {
-                    "loss": self._to_scalar_array(train_results["loss"]),
-                    "grad_norm": self._to_scalar_array(train_results["grad_norm"]),
-                }
-                metrics.update(train_results["all_mb_metrics"])
-                metrics = trainer_common.aggregate_training_metrics(metrics)
-                
+                metrics = trainer_common.prepare_training_metrics(train_results)
+
                 self._log_step(metrics, timer, train_results, total_steps)
 
                 timer.reset()
@@ -460,49 +444,24 @@ class SFTTrainer:
         train_results: dict[str, Any],
         total_steps: int,
     ) -> None:
-        timing_metrics = timer.get_timing_metrics(reduction_op="sum")
         print("\n📊 Training Results:")
         print(f"  • Loss: {float(metrics['loss']):.4f}")
+
+        timing_metrics = timer.get_timing_metrics(reduction_op="sum")
+
         if "total_flops" in train_results:
-            total_tflops = (
-                train_results["total_flops"]
-                / timing_metrics["policy_training"]
-                / 1e12
+            tflops_metrics = trainer_common.calculate_and_log_tflops(
+                train_results, timing_metrics
             )
-            num_ranks = train_results["num_ranks"]
-            print(
-                f"  • Training FLOPS: {total_tflops:.2f} TFLOPS ({total_tflops / num_ranks:.2f} TFLOPS per rank)"
-            )
-            if "theoretical_tflops" in train_results:
-                theoretical_tflops = train_results["theoretical_tflops"]
-                print(
-                    "  • Training Model Floating Point Utilization: "
-                    f"{100 * total_tflops / theoretical_tflops:.2f}%"
-                )
-                metrics["train_fp_utilization"] = (
-                    total_tflops / theoretical_tflops
-                )
+            if tflops_metrics:
+                metrics.update(tflops_metrics)
+
             total_valid_toks = train_results["all_mb_metrics"]["global_valid_toks"][0]
             print(f"  • Total valid tokens: {total_valid_toks}")
             print(f"  • Mean microbatch tokens: {total_valid_toks / len(train_results['all_mb_metrics']['global_valid_toks']):.0f}")
             print(f"  • Estimated throughput: {total_valid_toks / timing_metrics['policy_training']:.2f} tok/s")
-            
-        print("\n⏱️  Timing:")
-        total_time = timing_metrics.get("total_step_time", 0)
-        print(f"  • Total step time: {total_time:.2f}s")
-
-        for k, v in sorted(
-            timing_metrics.items(), key=lambda item: item[1], reverse=True
-        ):
-            if k != "total_step_time":
-                percent = (v / total_time * 100) if total_time > 0 else 0
-                print(f"  • {k}: {v:.2f}s ({percent:.1f}%)")
 
         self.logger.log_metrics(metrics, total_steps + 1, prefix="train")
-        self.logger.log_metrics(
-            timing_metrics, total_steps + 1, prefix="timing/train"
+        trainer_common.log_timing_metrics(
+            timing_metrics, total_steps + 1, self.logger, prefix="timing/train"
         )
-
-    def _to_scalar_array(self, tensor: torch.Tensor) -> np.ndarray:
-        """Convert a tensor to numpy array for logging purposes."""
-        return tensor.detach().cpu().numpy()

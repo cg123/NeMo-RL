@@ -450,7 +450,7 @@ class GRPOTrainer:
         # Call finish generation before training begins to ensure the policy is ready.
         await self.policy_generation.finish_generation()
 
-        if val_at_start and step == 0:
+        if trainer_common.should_validate_now(step, val_period, val_at_start):
             logging.info("\n🔍 Running initial validation...")
             val_metrics, validation_timings = self._validate(0)
             await self.policy_generation.finish_generation()
@@ -817,7 +817,7 @@ class GRPOTrainer:
         val_metrics: Optional[dict[str, Any]] = None
         validation_timings: Optional[dict[str, Any]] = None
 
-        if val_period > 0 and (step + 1) % val_period == 0:
+        if trainer_common.should_validate_now(step + 1, val_period, val_at_start):
             self.policy_generation.prepare_for_generation()
 
             val_metrics, validation_timings = self._validate(step+1)
