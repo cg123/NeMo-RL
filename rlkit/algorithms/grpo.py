@@ -15,7 +15,6 @@ import asyncio
 import logging
 import os
 from types import CoroutineType
-import warnings
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, NotRequired, Optional, TypedDict, TypeVar, cast
@@ -843,21 +842,18 @@ class GRPOTrainer:
 
         self.policy.prepare_for_training()
 
-        self.grpo_save_state["step"] = step + 1
+        # Map val_metrics accuracy to val_reward for GRPO
+        grpo_val_metrics = None
         if val_metrics is not None:
-            self.grpo_save_state["val_reward"] = val_metrics["accuracy"]
-        elif "val_reward" in self.grpo_save_state:
-            del self.grpo_save_state["val_reward"]
-        self.grpo_save_state["consumed_samples"] = consumed_samples
+            grpo_val_metrics = {"val_reward": val_metrics["accuracy"]}
 
-        if self.master_config["checkpointing"]["metric_name"] is not None:
-            metric_name = self.master_config["checkpointing"]["metric_name"]
-            if metric_name not in self.grpo_save_state:
-                warnings.warn(
-                    f"You asked to save checkpoints based on {metric_name} but the metric is not found in the save state. "
-                    "Saving most recent k checkpoints instead."
-                )
-                self.master_config["checkpointing"]["metric_name"] = None
+        trainer_common.update_save_state_for_checkpoint(
+            self.grpo_save_state,
+            step=step + 1,
+            consumed_samples=consumed_samples,
+            val_metrics=grpo_val_metrics,
+            master_config=self.master_config,
+        )
 
         trainer_common.save_training_checkpoint(
             self.checkpointer,

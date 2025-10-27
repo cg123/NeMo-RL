@@ -503,25 +503,15 @@ def rm_train(
                     or (total_steps + 1) % master_config["checkpointing"]["save_period"]
                     == 0
                 ):
-                    ## +1 because step is 0-indexed
-                    rm_save_state["step"] = (current_step + 1) % len(train_dataloader)
-                    rm_save_state["total_steps"] = total_steps + 1
-                    rm_save_state["epoch"] = current_epoch
-                    if val_metrics is not None:
-                        rm_save_state["val_loss"] = val_metrics["val_loss"]
-                    elif "val_loss" in rm_save_state:
-                        del rm_save_state["val_loss"]
-
-                    if master_config["checkpointing"]["metric_name"] is not None:
-                        if (
-                            master_config["checkpointing"]["metric_name"]
-                            not in rm_save_state
-                        ):
-                            warnings.warn(
-                                f"You asked to save checkpoints based on {master_config['checkpointing']['metric_name']} but the metric is not found in the save state. "
-                                "Saving most recent k checkpoints instead."
-                            )
-                            master_config["checkpointing"]["metric_name"] = None
+                    trainer_common.update_save_state_for_checkpoint(
+                        rm_save_state,
+                        step=(current_step + 1) % len(train_dataloader),
+                        consumed_samples=rm_save_state["consumed_samples"],
+                        val_metrics=val_metrics,
+                        master_config=master_config,
+                        epoch=current_epoch,
+                        total_steps=total_steps + 1,
+                    )
 
                     trainer_common.save_training_checkpoint(
                         checkpointer,
@@ -554,21 +544,10 @@ def rm_train(
             )
             print(f"  • Num valid samples: {float(metrics['num_valid_samples']):.0f}")
 
-            print("\n⏱️  Timing:")
-            # Display total time first, separately
-            total_time = timing_metrics.get("total_step_time", 0)
-            print(f"  • Total step time: {total_time:.2f}s")
-
-            # Display all other timing metrics (if any)
-            for k, v in sorted(
-                timing_metrics.items(), key=lambda item: item[1], reverse=True
-            ):
-                if k != "total_step_time":
-                    percent = (v / total_time * 100) if total_time > 0 else 0
-                    print(f"  • {k}: {v:.2f}s ({percent:.1f}%)")
-
             logger.log_metrics(metrics, total_steps + 1, prefix="train")
-            logger.log_metrics(timing_metrics, total_steps + 1, prefix="timing/train")
+            trainer_common.log_timing_metrics(
+                timing_metrics, total_steps + 1, logger, prefix="timing/train"
+            )
 
             timer.reset()
             current_step += 1
