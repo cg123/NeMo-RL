@@ -377,7 +377,7 @@ def create_cluster(
 # ===============================================================================
 
 
-def should_run_validation(
+def should_validate_now(
     step: int,
     val_period: int,
     val_at_start: bool,
@@ -568,22 +568,6 @@ def calculate_and_log_tflops(
         metrics["train_fp_utilization"] = fp_utilization
 
     return metrics
-
-
-def should_stop_training(
-    current_step: int,
-    max_steps: int,
-) -> bool:
-    """Check if training should stop based on max steps.
-
-    Args:
-        current_step: Current training step (0-indexed)
-        max_steps: Maximum number of steps
-
-    Returns:
-        True if training should stop
-    """
-    return max_steps != -1 and current_step >= max_steps
 
 
 # ===============================================================================

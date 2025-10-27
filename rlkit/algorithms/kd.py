@@ -282,11 +282,6 @@ class KDTrainer:
         total_gpus_per_node = cluster_config["gpus_per_node"]
 
         # Validate cluster allocation
-        # Calculate total GPUs
-        total_gpus = total_nodes * total_gpus_per_node
-        teacher_total_gpus = teacher_num_nodes * teacher_gpus_per_node
-
-        # Check if teacher allocation is valid
         if teacher_num_nodes > total_nodes:
             raise ValueError(
                 f"Teacher requires {teacher_num_nodes} nodes but only {total_nodes} available. "
@@ -301,32 +296,25 @@ class KDTrainer:
             )
 
         student_num_nodes = total_nodes - teacher_num_nodes
-        student_gpus_per_node = total_gpus_per_node
-        student_total_gpus = student_num_nodes * student_gpus_per_node
-
         if student_num_nodes == 0:
             raise ValueError(
                 f"No nodes remaining for student (total={total_nodes}, teacher={teacher_num_nodes}). "
                 f"Increase cluster.num_nodes or reduce teacher.cluster.num_nodes."
             )
 
-        logging.info("  ✓ Cluster allocation validated:")
-        logging.info(f"    - Total: {total_nodes} nodes × {total_gpus_per_node} GPUs = {total_gpus} GPUs")
         logging.info(
-            f"    - Teacher: {teacher_num_nodes} nodes × {teacher_gpus_per_node} GPUs = {teacher_total_gpus} GPUs"
-        )
-        logging.info(
-            f"    - Student: {student_num_nodes} nodes × {student_gpus_per_node} GPUs = {student_total_gpus} GPUs"
+            f"  ✓ Cluster allocation: {teacher_num_nodes} teacher nodes, "
+            f"{student_num_nodes} student nodes ({total_gpus_per_node} GPUs/node)"
         )
 
         student_cluster = RayVirtualCluster(
             name="kd_student_cluster",
-            bundle_ct_per_node_list=[student_gpus_per_node] * student_num_nodes,
+            bundle_ct_per_node_list=[total_gpus_per_node] * student_num_nodes,
             use_gpus=True,
-            num_gpus_per_node=student_gpus_per_node,
+            num_gpus_per_node=total_gpus_per_node,
             max_colocated_worker_groups=1,
         )
-        logging.info(f"  ✓ Student cluster: {student_num_nodes} nodes × {student_gpus_per_node} GPUs")
+        logging.info(f"  ✓ Student cluster: {student_num_nodes} nodes × {total_gpus_per_node} GPUs")
 
         return student_cluster, teacher_cluster
 
@@ -480,7 +468,8 @@ class KDTrainer:
         not raw logits, because vLLM (the inference backend) doesn't expose logits.
 
         Returns:
-            teacher_logprobs: Log probabilities from teacher [batch, seq_len, vocab]
+            teacher_logprobs: Full vocabulary log probabilities [batch, seq_len, vocab_size]
+                (not per-token logprobs, but the full distribution for each position)
         """
         # Prepare teacher for logprob inference
         self.teacher_policy.prepare_for_lp_inference()
@@ -490,6 +479,15 @@ class KDTrainer:
 
         # Extract log probabilities from output dict
         teacher_logprobs = teacher_output["logprobs"]
+
+        # Validate shape: should be [batch, seq_len, vocab_size]
+        if teacher_logprobs.ndim != 3:
+            raise ValueError(
+                f"Expected teacher logprobs to have shape [batch, seq_len, vocab_size], "
+                f"but got shape {teacher_logprobs.shape} with {teacher_logprobs.ndim} dimensions. "
+                f"This indicates the teacher policy is returning per-token logprobs instead of "
+                f"full vocabulary distributions. Check that get_logprobs() is configured correctly."
+            )
 
         # Optionally convert to fp16 to save memory (teacher logprobs can be large)
         # For 32k vocab and 4096 seq len, this saves ~250MB per batch
