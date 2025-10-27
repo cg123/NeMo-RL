@@ -10,9 +10,6 @@ from rlkit.config.checkpointing import CheckpointingConfig
 # Default values for optional KD parameters
 KD_DEFAULT_ALPHA = 0.5
 KD_DEFAULT_TEMPERATURE = 2.0
-KD_DEFAULT_TEACHER_LOGPROBS_FP16 = False
-KD_DEFAULT_VAL_PERIOD = 0
-KD_DEFAULT_VAL_AT_START = False
 
 
 class KDLoggerConfig(LoggerConfig):

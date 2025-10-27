@@ -41,8 +41,6 @@ from rlkit.config import (
     DataConfig,
     KD_DEFAULT_ALPHA,
     KD_DEFAULT_TEMPERATURE,
-    KD_DEFAULT_VAL_PERIOD,
-    KD_DEFAULT_VAL_AT_START,
 )
 from rlkit.distributed.batched_data_dict import BatchedDataDict
 from rlkit.distributed.virtual_cluster import RayVirtualCluster
@@ -53,16 +51,6 @@ from rlkit.utils.timer import TimeoutChecker, Timer
 from rlkit.utils.nsys import maybe_gpu_profile_step
 
 import ray
-
-
-# Default timeout values for KD operations
-DEFAULT_TEACHER_INFERENCE_TIMEOUT = 300  # 5 minutes
-DEFAULT_VALIDATION_TIMEOUT = 600  # 10 minutes
-DEFAULT_CHECKPOINTING_TIMEOUT = 120  # 2 minutes
-
-# Default validation settings
-DEFAULT_VAL_PERIOD = 100  # Validate every 100 steps
-DEFAULT_VAL_BATCHES = 10  # Number of validation batches
 
 
 class KDValidationMetrics(TypedDict):
@@ -281,7 +269,7 @@ class KDTrainer:
 
         # Setup validation dataloader if enabled
         val_dataloader = None
-        if kd_config["val_period"] > 0 or kd_config["val_at_start"]:
+        if kd_config.get("val_period", 0) > 0 or kd_config.get("val_at_start", False):
             assert val_dataset is not None, "Validation dataset required if validation enabled"
             val_batch_size = kd_config["val_global_batch_size"] // kd_config["val_micro_batch_size"]
             val_dataloader = StatefulDataLoader(
@@ -293,46 +281,6 @@ class KDTrainer:
             logging.info(f"  ✓ Validation dataloader loaded with {len(val_dataset)} samples")
 
         return train_dataloader, val_dataloader
-
-    def _validate_cluster_allocation(self, cluster_config: ClusterConfig, teacher_cluster_config: dict) -> None:
-        """Validate that cluster resources are properly allocated.
-
-        Ensures that teacher + student don't exceed total available resources.
-
-        Args:
-            cluster_config: Total cluster resources
-            teacher_cluster_config: Teacher's dedicated cluster allocation
-
-        Raises:
-            ValueError: If resource allocation is invalid
-        """
-        total_gpus = cluster_config["num_nodes"] * cluster_config["gpus_per_node"]
-        teacher_gpus = teacher_cluster_config["num_nodes"] * teacher_cluster_config["gpus_per_node"]
-        student_gpus = total_gpus - teacher_gpus
-
-        if teacher_gpus <= 0:
-            raise ValueError(
-                f"Teacher cluster allocation is invalid: {teacher_gpus} GPUs. "
-                "Must allocate at least 1 GPU for teacher."
-            )
-
-        if student_gpus <= 0:
-            raise ValueError(
-                f"No GPUs available for student after allocating {teacher_gpus} GPUs to teacher. "
-                f"Total cluster has {total_gpus} GPUs. "
-                "Please increase total cluster size or decrease teacher cluster allocation."
-            )
-
-        if teacher_gpus > total_gpus:
-            raise ValueError(
-                f"Teacher cluster allocation ({teacher_gpus} GPUs) exceeds total "
-                f"cluster resources ({total_gpus} GPUs)."
-            )
-
-        logging.info("✓ Cluster allocation validated:")
-        logging.info(f"  • Total GPUs: {total_gpus}")
-        logging.info(f"  • Teacher GPUs: {teacher_gpus}")
-        logging.info(f"  • Student GPUs: {student_gpus}")
 
     def _setup_clusters(
         self,
@@ -368,17 +316,14 @@ class KDTrainer:
         # Check if teacher allocation is valid
         if teacher_num_nodes > total_nodes:
             raise ValueError(
-                f"Invalid cluster allocation: Teacher requires {teacher_num_nodes} nodes, "
-                f"but only {total_nodes} total nodes available.\n"
-                f"  Teacher GPUs: {teacher_num_nodes} nodes × {teacher_gpus_per_node} GPUs/node = {teacher_total_gpus} GPUs\n"
-                f"  Total GPUs: {total_nodes} nodes × {total_gpus_per_node} GPUs/node = {total_gpus} GPUs\n"
-                f"Solution: Reduce teacher.cluster.num_nodes or increase cluster.num_nodes"
+                f"Teacher requires {teacher_num_nodes} nodes but only {total_nodes} available. "
+                f"Reduce teacher.cluster.num_nodes or increase cluster.num_nodes."
             )
 
         if teacher_gpus_per_node != total_gpus_per_node:
             raise ValueError(
-                f"Invalid cluster allocation: teacher.cluster.gpus_per_node ({teacher_gpus_per_node}) "
-                f"must equal cluster.gpus_per_node ({total_gpus_per_node}).\n"
+                f"teacher.cluster.gpus_per_node ({teacher_gpus_per_node}) "
+                f"must equal cluster.gpus_per_node ({total_gpus_per_node}). "
                 f"NeMo RL requires uniform GPUs per node across the cluster."
             )
 
@@ -388,11 +333,8 @@ class KDTrainer:
 
         if student_num_nodes == 0:
             raise ValueError(
-                f"Invalid cluster allocation: No nodes remaining for student training.\n"
-                f"  Total nodes: {total_nodes}\n"
-                f"  Teacher nodes: {teacher_num_nodes}\n"
-                f"  Student nodes: {student_num_nodes} (= total - teacher)\n"
-                f"Solution: Increase cluster.num_nodes or reduce teacher.cluster.num_nodes"
+                f"No nodes remaining for student (total={total_nodes}, teacher={teacher_num_nodes}). "
+                f"Increase cluster.num_nodes or reduce teacher.cluster.num_nodes."
             )
 
         logging.info("  ✓ Cluster allocation validated:")
@@ -432,25 +374,9 @@ class KDTrainer:
         student_tp_size = policy_config["dtensor_v2_cfg"].get("tensor_parallel_size", 1)
         if student_tp_size > 1:
             raise NotImplementedError(
-                f"Knowledge Distillation does not currently support student vocab parallelism. "
-                f"Student is configured with tensor_parallel_size={student_tp_size}, "
-                f"but KD requires computing KL divergence over the full vocabulary distribution.\n"
-                f"\n"
-                f"Current issue: KnowledgeDistillationLoss computes log_softmax on the student logits, "
-                f"which with TP only contains a vocab shard [batch, seq, vocab_size/tp_size]. "
-                f"This produces incorrect probability distributions and KL divergence values.\n"
-                f"\n"
-                f"Solutions:\n"
-                f"  1. Set student_policy.dtensor_v2_cfg.tensor_parallel_size=1 (recommended)\n"
-                f"  2. Use data parallelism instead (increase num_nodes)\n"
-                f"  3. Use pipeline parallelism if the student model is large\n"
-                f"\n"
-                f"Note: Student models for KD are typically small (1B-7B) and don't require TP. "
-                f"If you need TP for the student, consider if distillation is the right approach.\n"
-                f"\n"
-                f"Future work: Support for matched TP sharding between teacher and student is planned. "
-                f"This would allow computing KL divergence correctly across vocab shards using "
-                f"distributed partition function computation. Estimated effort: 3-5 days."
+                f"KD does not support tensor_parallel_size > 1 (student has TP={student_tp_size}). "
+                f"Set student_policy.dtensor_v2_cfg.tensor_parallel_size=1 or use data/pipeline parallelism. "
+                f"See docs/design-docs/kd-vocab-parallelism-future-work.md for details."
             )
 
         return Policy(
@@ -484,24 +410,9 @@ class KDTrainer:
         teacher_tp_size = teacher_config.get("tensor_parallel_size", 1)
         if teacher_tp_size > 1:
             raise NotImplementedError(
-                f"Knowledge Distillation does not currently support teacher vocab parallelism. "
-                f"Teacher is configured with tensor_parallel_size={teacher_tp_size}, "
-                f"but KD requires the full vocabulary distribution from the teacher.\n"
-                f"\n"
-                f"Current issue: Policy.get_logprobs() returns per-token log probabilities "
-                f"with shape [batch, seq_len], not full distributions [batch, seq_len, vocab_size]. "
-                f"With TP, the full vocabulary distribution is never materialized - each rank only "
-                f"computes logprobs for tokens in its vocab shard. KD needs the complete distribution "
-                f"to compute KL divergence.\n"
-                f"\n"
-                f"Solutions:\n"
-                f"  1. Set teacher.tensor_parallel_size=1 (recommended)\n"
-                f"  2. Use pipeline parallelism for the teacher instead (if model is large)\n"
-                f"  3. Wait for full logprob gathering support (future work)\n"
-                f"\n"
-                f"Future work: Add Policy.get_full_logprobs() method that returns "
-                f"[batch, seq, vocab_size] tensors by gathering across TP ranks, or implement "
-                f"matched TP sharding approach. Estimated effort: 3-5 days."
+                f"KD does not support tensor_parallel_size > 1 (teacher has TP={teacher_tp_size}). "
+                f"Set teacher.tensor_parallel_size=1 or use pipeline parallelism. "
+                f"See docs/design-docs/kd-vocab-parallelism-future-work.md for details."
             )
 
         # Build PolicyConfig for teacher
@@ -511,15 +422,12 @@ class KDTrainer:
             teacher_gpus = teacher_config["cluster"]["num_nodes"] * teacher_config["cluster"]["gpus_per_node"]
             if teacher_gpus % teacher_ep_size != 0:
                 raise ValueError(
-                    f"Teacher expert_parallel_size ({teacher_ep_size}) must evenly divide "
-                    f"the number of GPUs allocated to the teacher ({teacher_gpus}).\n"
-                    f"Teacher cluster: {teacher_config['cluster']['num_nodes']} nodes × "
-                    f"{teacher_config['cluster']['gpus_per_node']} GPUs/node = {teacher_gpus} GPUs\n"
-                    f"Solution: Adjust teacher.expert_parallel_size or teacher.cluster allocation."
+                    f"teacher.expert_parallel_size ({teacher_ep_size}) must evenly divide "
+                    f"teacher GPUs ({teacher_gpus}). Adjust teacher.expert_parallel_size or cluster allocation."
                 )
 
-        # Use student's logprob batch size for consistency
-        student_logprob_batch_size = self.master_config["student_policy"]["logprob_batch_size"]
+        # Teacher and student must use same logprob batch size for data alignment
+        shared_logprob_batch_size = self.master_config["student_policy"]["logprob_batch_size"]
 
         teacher_policy_config: PolicyConfig = {
             "model_name": teacher_config["model_name"],
@@ -541,7 +449,7 @@ class KDTrainer:
             # Inference-only config (placeholders for unused training params)
             "train_global_batch_size": 1,
             "train_micro_batch_size": 1,
-            "logprob_batch_size": student_logprob_batch_size,
+            "logprob_batch_size": shared_logprob_batch_size,
             # These aren't used for teacher but Policy requires them
             "max_grad_norm": 1.0,
             "optimizer": {
@@ -730,11 +638,14 @@ class KDTrainer:
                     )
                 else:
                     val_metrics["val_loss"] += float(val_results["loss"])
-                    # Extract component losses if available
+                    # Average component losses across all microbatches
                     if "all_mb_metrics" in val_results and len(val_results["all_mb_metrics"]) > 0:
-                        first_mb = val_results["all_mb_metrics"][0]
-                        val_metrics["val_base_loss"] += first_mb.get("base_loss", 0.0)
-                        val_metrics["val_kd_loss"] += first_mb.get("kd_loss", 0.0)
+                        # Accumulate across all microbatches for this validation batch
+                        batch_base_loss = sum(mb.get("base_loss", 0.0) for mb in val_results["all_mb_metrics"])
+                        batch_kd_loss = sum(mb.get("kd_loss", 0.0) for mb in val_results["all_mb_metrics"])
+                        num_mbs = len(val_results["all_mb_metrics"])
+                        val_metrics["val_base_loss"] += batch_base_loss / num_mbs if num_mbs > 0 else 0.0
+                        val_metrics["val_kd_loss"] += batch_kd_loss / num_mbs if num_mbs > 0 else 0.0
                     num_valid_batches += 1
 
                 # Limit validation batches if configured
@@ -790,8 +701,8 @@ class KDTrainer:
         kd_config = self.master_config["kd"]
         max_num_epochs = kd_config["max_num_epochs"]
         max_num_steps = kd_config["max_num_steps"]
-        val_period = kd_config.get("val_period", KD_DEFAULT_VAL_PERIOD)
-        val_at_start = kd_config.get("val_at_start", KD_DEFAULT_VAL_AT_START)
+        val_period = kd_config.get("val_period", 0)
+        val_at_start = kd_config.get("val_at_start", False)
 
         # Initial validation
         if val_at_start and total_steps == 0:
