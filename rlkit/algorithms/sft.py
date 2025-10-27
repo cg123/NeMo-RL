@@ -110,7 +110,7 @@ class SFTTrainer:
         
         logging.info("Setting up compute cluster...")
 
-        self.cluster = self._setup_cluster(cluster_config)
+        self.cluster = trainer_common.create_cluster("sft_train_cluster", cluster_config)
         
         if last_checkpoint_path:
             weights_path = Path(last_checkpoint_path) / "policy" / "weights"
@@ -165,10 +165,6 @@ class SFTTrainer:
 
         return train_dataloader, val_dataloader
 
-    def _setup_cluster(self, cluster_config: ClusterConfig) -> RayVirtualCluster:
-        logging.info("Setting up compute cluster...")
-        return trainer_common.create_cluster("sft_train_cluster", cluster_config)
-
     def _initialize_policy(
         self,
         train_cluster: RayVirtualCluster,
@@ -192,51 +188,6 @@ class SFTTrainer:
             use_cut_cross_entropy=use_cce,
         )
 
-    def _process_batch(self, batch: BatchedDataDict) -> BatchedDataDict:
-        max_seq_len = self.master_config["policy"]["max_total_sequence_length"]
-        max_batch_len = min(max([len(x) for x in batch["input_ids"]]), max_seq_len)
-        batch_size = len(batch["input_ids"])
-        train_data = {
-            "input_ids": [None for _ in range(batch_size)],
-            "input_lengths": [None for _ in range(batch_size)],
-            "token_mask": [None for _ in range(batch_size)],
-            "sample_mask": [None for _ in range(batch_size)],
-        }
-        
-        truncated = 0
-        
-        if self.master_config["sft"].get("run_vram_torture_test", False):
-            logging.warning("Filling batch with BOS token to test VRAM usage. Do not use this for training!")
-        
-        for i, (input_ids, token_mask, sample_mask) in enumerate(zip(
-            batch["input_ids"],
-            batch["token_mask"],
-            batch["sample_mask"]
-        )):
-            # Run VRAM torture test by filling the batch with BOS tokens (or whatever the first token in a sequence is).
-            if self.master_config["sft"].get("run_vram_torture_test", False):
-                train_data["input_ids"][i] = torch.tensor([input_ids[0]] * max_seq_len)
-                train_data["token_mask"][i] = torch.ones_like(train_data["input_ids"][i])
-                train_data["sample_mask"][i] = torch.tensor(1.0)
-                train_data["input_lengths"][i] = torch.tensor(max_seq_len)
-                continue
-            
-            if len(input_ids) > max_batch_len:
-                # This sample is too long, so we truncate it
-                input_ids = input_ids[:max_batch_len]
-                token_mask = token_mask[:max_batch_len]
-                truncated += 1
-            
-            train_data["input_ids"][i] = _pad_tensor(torch.tensor(input_ids), max_batch_len, "right", pad_value=self.tokenizer.pad_token_id)
-            train_data["input_lengths"][i] = torch.tensor(len(input_ids))
-            train_data["token_mask"][i] = _pad_tensor(torch.tensor(token_mask), max_batch_len, "right", pad_value=0)
-            train_data["sample_mask"][i] = torch.tensor(sample_mask)
-        
-        if truncated > 0:
-            logging.warning(f"Truncated {truncated} samples from the batch due to exceeding the maximum sequence length")
-        
-        return BatchedDataDict({k: torch.stack(v) for k, v in train_data.items()})
-
     async def validate(self, step: int) -> Optional[tuple[dict[str, float], dict[str, float]]]:
         """Run validation on the validation dataset."""
         if self.val_dataloader is None:
@@ -256,7 +207,11 @@ class SFTTrainer:
             for batch_idx, raw_val_batch in enumerate(self.val_dataloader):
                 val_batch = BatchedDataDict(raw_val_batch)
                 
-                val_data = self._process_batch(val_batch)
+                val_data = trainer_common.process_supervised_batch(
+                    val_batch,
+                    max_seq_len=self.master_config["policy"]["max_total_sequence_length"],
+                    tokenizer_pad_token_id=self.tokenizer.pad_token_id,
+                )
 
                 val_results = await self.policy.train(
                     val_data,
@@ -361,7 +316,12 @@ class SFTTrainer:
                 with timer.time("total_step_time"):
                     logging.info("Preparing batch...")
                     with timer.time("data_processing"):
-                        train_data = self._process_batch(batch)
+                        train_data = trainer_common.process_supervised_batch(
+                            batch,
+                            max_seq_len=self.master_config["policy"]["max_total_sequence_length"],
+                            tokenizer_pad_token_id=self.tokenizer.pad_token_id,
+                            run_vram_torture_test=self.master_config["sft"].get("run_vram_torture_test", False),
+                        )
 
                     logging.info("Taking a training step...")
                     with timer.time("policy_training"):

@@ -599,3 +599,209 @@ def should_stop_training(
         True if training should stop
     """
     return max_steps != -1 and current_step >= max_steps
+
+
+# ===============================================================================
+# Batch Processing
+# ===============================================================================
+
+
+def process_supervised_batch(
+    batch: "BatchedDataDict",
+    max_seq_len: int,
+    tokenizer_pad_token_id: int,
+    run_vram_torture_test: bool = False,
+) -> "BatchedDataDict":
+    """Process batch for supervised training (SFT/KD).
+
+    Converts tokenized data into the format expected by Policy.train().
+    Handles truncation, padding, and optional VRAM torture testing.
+
+    Args:
+        batch: Input batch with 'input_ids', 'token_mask', 'sample_mask' fields
+        max_seq_len: Maximum sequence length
+        tokenizer_pad_token_id: Padding token ID for input_ids
+        run_vram_torture_test: If True, fills batch with first token for VRAM testing
+
+    Returns:
+        BatchedDataDict with padded and stacked tensors
+    """
+    from rlkit.algorithms.utils import _pad_tensor
+    from rlkit.distributed.batched_data_dict import BatchedDataDict
+
+    max_batch_len = min(max([len(x) for x in batch["input_ids"]]), max_seq_len)
+    batch_size = len(batch["input_ids"])
+
+    train_data = {
+        "input_ids": [None for _ in range(batch_size)],
+        "input_lengths": [None for _ in range(batch_size)],
+        "token_mask": [None for _ in range(batch_size)],
+        "sample_mask": [None for _ in range(batch_size)],
+    }
+
+    truncated = 0
+
+    if run_vram_torture_test:
+        logging.warning(
+            "Filling batch with BOS token to test VRAM usage. Do not use this for training!"
+        )
+
+    for i, (input_ids, token_mask, sample_mask) in enumerate(
+        zip(batch["input_ids"], batch["token_mask"], batch["sample_mask"])
+    ):
+        # Run VRAM torture test by filling the batch with BOS tokens
+        if run_vram_torture_test:
+            train_data["input_ids"][i] = torch.tensor([input_ids[0]] * max_seq_len)
+            train_data["token_mask"][i] = torch.ones_like(
+                train_data["input_ids"][i]
+            )
+            train_data["sample_mask"][i] = torch.tensor(1.0)
+            train_data["input_lengths"][i] = torch.tensor(max_seq_len)
+            continue
+
+        # Truncate if exceeds max length
+        if len(input_ids) > max_batch_len:
+            input_ids = input_ids[:max_batch_len]
+            token_mask = token_mask[:max_batch_len]
+            truncated += 1
+
+        # Pad and convert to tensors
+        train_data["input_ids"][i] = _pad_tensor(
+            torch.tensor(input_ids),
+            max_batch_len,
+            "right",
+            pad_value=tokenizer_pad_token_id,
+        )
+        train_data["input_lengths"][i] = torch.tensor(len(input_ids))
+        train_data["token_mask"][i] = _pad_tensor(
+            torch.tensor(token_mask), max_batch_len, "right", pad_value=0
+        )
+        train_data["sample_mask"][i] = torch.tensor(sample_mask)
+
+    if truncated > 0:
+        logging.warning(
+            f"Truncated {truncated} samples from the batch due to exceeding "
+            f"the maximum sequence length ({max_seq_len})"
+        )
+
+    return BatchedDataDict({k: torch.stack(v) for k, v in train_data.items()})
+
+# ===============================================================================
+# Validation Helpers
+# ===============================================================================
+
+
+def run_validation_loop(
+    val_dataloader: Any,
+    policy: Any,
+    loss_fn: Any,
+    step: int,
+    logger: Logger,
+    max_val_batches: int,
+    val_global_batch_size: int,
+    val_micro_batch_size: int,
+    process_batch_fn: Callable[[Any], "BatchedDataDict"],
+    metric_names: list[str],
+    accumulate_metrics_fn: Optional[Callable[[dict, dict], None]] = None,
+    prepare_data_fn: Optional[Callable[["BatchedDataDict"], "BatchedDataDict"]] = None,
+) -> Optional[tuple[dict[str, float], dict[str, float]]]:
+    """Run validation loop with common scaffolding.
+
+    Args:
+        val_dataloader: Validation dataloader
+        policy: Policy to validate
+        loss_fn: Loss function
+        step: Current training step
+        logger: Logger instance
+        max_val_batches: Maximum number of validation batches (-1 for all)
+        val_global_batch_size: Global batch size for validation
+        val_micro_batch_size: Micro batch size for validation
+        process_batch_fn: Function to process raw batch into model input
+        metric_names: List of metric names to log (in order)
+        accumulate_metrics_fn: Optional custom function to accumulate metrics
+        prepare_data_fn: Optional function to prepare data before policy.train()
+
+    Returns:
+        Tuple of (val_metrics, timing_metrics) or None if no valid batches
+    """
+    if val_dataloader is None:
+        logging.info("No validation dataloader provided, skipping validation")
+        return None
+
+    timer = Timer()
+
+    with timer.time("total_validation_time"):
+        logging.info(f"▶ Starting validation at step {step}...")
+
+        # Initialize metrics dict with zeros
+        val_metrics = {name: 0.0 for name in metric_names}
+        num_valid_batches = 0
+
+        policy.prepare_for_training()
+
+        for batch_idx, raw_val_batch in enumerate(val_dataloader):
+            if max_val_batches > 0 and batch_idx >= max_val_batches:
+                break
+
+            # Process batch
+            val_data = process_batch_fn(raw_val_batch)
+
+            # Optional additional data preparation (e.g., KD teacher logprobs)
+            if prepare_data_fn:
+                val_data = prepare_data_fn(val_data)
+
+            # Run validation
+            val_results = policy.train(
+                val_data,
+                loss_fn,
+                eval_mode=True,
+                gbs=val_global_batch_size,
+                mbs=val_micro_batch_size,
+            )
+
+            if len(val_results["all_mb_metrics"]) == 0:
+                warnings.warn(
+                    "No validation metrics were collected for this batch. "
+                    "This is likely because there were no valid samples."
+                )
+            else:
+                # Default accumulation: sum up losses
+                if accumulate_metrics_fn:
+                    accumulate_metrics_fn(val_metrics, val_results)
+                else:
+                    # Simple default: accumulate loss
+                    val_metrics[metric_names[0]] += float(val_results["loss"])
+
+                num_valid_batches += 1
+
+        # Average metrics
+        if num_valid_batches > 0:
+            for key in val_metrics:
+                if isinstance(val_metrics[key], (int, float)):
+                    val_metrics[key] /= num_valid_batches
+        else:
+            warnings.warn(
+                "No validation metrics were collected. "
+                "This is likely because there were no valid samples in the validation set."
+            )
+            # Still return timing even if no valid batches
+            timing_metrics = timer.get_timing_metrics(reduction_op="sum")
+            logger.log_metrics(timing_metrics, step, prefix="timing/validation")
+            return None
+
+        policy.prepare_for_training()
+
+    timing_metrics = timer.get_timing_metrics(reduction_op="sum")
+
+    # Log results
+    if num_valid_batches > 0:
+        log_validation_results(
+            val_metrics,
+            timing_metrics,
+            step,
+            logger,
+            metric_names=metric_names,
+        )
+
+    timer.reset()
+    return val_metrics, timing_metrics

@@ -473,51 +473,6 @@ class KDTrainer:
         
         logging.info(f"  ✓ Sequence length validated: {student_max_len}")
 
-    def _process_batch(self, batch: BatchedDataDict) -> BatchedDataDict:
-        """Process batch for training (reuse SFT pattern).
-
-        Converts tokenized data into the format expected by Policy.train().
-        """
-        max_seq_len = self.master_config["student_policy"]["max_total_sequence_length"]
-        max_batch_len = min(max([len(x) for x in batch["input_ids"]]), max_seq_len)
-        batch_size = len(batch["input_ids"])
-
-        train_data = {
-            "input_ids": [None for _ in range(batch_size)],
-            "input_lengths": [None for _ in range(batch_size)],
-            "token_mask": [None for _ in range(batch_size)],
-            "sample_mask": [None for _ in range(batch_size)],
-        }
-
-        truncated = 0
-
-        for i, (input_ids, token_mask, sample_mask) in enumerate(
-            zip(batch["input_ids"], batch["token_mask"], batch["sample_mask"])
-        ):
-            if len(input_ids) > max_batch_len:
-                # Truncate sample if too long
-                input_ids = input_ids[:max_batch_len]
-                token_mask = token_mask[:max_batch_len]
-                truncated += 1
-
-            train_data["input_ids"][i] = _pad_tensor(
-                torch.tensor(input_ids),
-                max_batch_len,
-                "right",
-                pad_value=self.tokenizer.pad_token_id,
-            )
-            train_data["input_lengths"][i] = torch.tensor(len(input_ids))
-            train_data["token_mask"][i] = _pad_tensor(torch.tensor(token_mask), max_batch_len, "right", pad_value=0)
-            train_data["sample_mask"][i] = torch.tensor(sample_mask)
-
-        if truncated > 0:
-            logging.warning(
-                f"Truncated {truncated} samples from the batch due to exceeding "
-                f"the maximum sequence length ({max_seq_len})"
-            )
-
-        return BatchedDataDict({k: torch.stack(v) for k, v in train_data.items()})
-
     async def _get_teacher_logprobs(self, data: BatchedDataDict) -> torch.Tensor:
         """Get teacher log probabilities for the batch (teacher inference).
 
@@ -575,7 +530,11 @@ class KDTrainer:
                 val_batch = BatchedDataDict(raw_val_batch)
 
                 # Process batch
-                val_data = self._process_batch(val_batch)
+                val_data = trainer_common.process_supervised_batch(
+                    val_batch,
+                    max_seq_len=self.master_config["student_policy"]["max_total_sequence_length"],
+                    tokenizer_pad_token_id=self.tokenizer.pad_token_id,
+                )
 
                 # Get teacher log probabilities
                 teacher_logprobs = await self._get_teacher_logprobs(val_data)
@@ -695,7 +654,11 @@ class KDTrainer:
                     # 1. Process batch
                     logging.debug("Processing batch...")
                     with timer.time("data_processing"):
-                        train_data = self._process_batch(batch)
+                        train_data = trainer_common.process_supervised_batch(
+                            batch,
+                            max_seq_len=self.master_config["student_policy"]["max_total_sequence_length"],
+                            tokenizer_pad_token_id=self.tokenizer.pad_token_id,
+                        )
 
                     # 2. Get teacher log probabilities (synchronous)
                     logging.debug("Computing teacher log probabilities...")

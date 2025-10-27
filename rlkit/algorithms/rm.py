@@ -52,6 +52,7 @@ from rlkit.utils.checkpoint import CheckpointManager
 from rlkit.utils.logger import Logger
 from rlkit.utils.nsys import maybe_gpu_profile_step
 from rlkit.utils.timer import Timer
+from rlkit.utils.timer import TimeoutChecker
 
 
 class RMSaveState(TypedDict):
@@ -375,6 +376,11 @@ def rm_train(
 ):
     # Run basic rm training
     timer = Timer()
+    timeout = TimeoutChecker(
+        timeout=master_config["checkpointing"]["checkpoint_must_save_by"],
+        fit_last_save_time=True,
+    )
+    timeout.start_iterations()
 
     if rm_save_state is None:
         rm_save_state = _default_rm_save_state()
@@ -498,10 +504,16 @@ def rm_train(
                 rm_save_state["consumed_samples"] += master_config["policy"][
                     "train_global_batch_size"
                 ]
+                timeout.mark_iteration()
+                should_save_by_step, should_save_by_timeout = trainer_common.should_checkpoint(
+                    total_steps + 1,
+                    master_config["checkpointing"]["save_period"],
+                    is_last_step,
+                    timeout,
+                )
+
                 if master_config["checkpointing"]["enabled"] and (
-                    is_last_step
-                    or (total_steps + 1) % master_config["checkpointing"]["save_period"]
-                    == 0
+                    should_save_by_step or should_save_by_timeout
                 ):
                     trainer_common.update_save_state_for_checkpoint(
                         rm_save_state,
